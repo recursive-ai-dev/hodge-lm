@@ -1,4 +1,5 @@
 venv/
-.venv/artifacts/
+.venv/
+artifacts/
 *.pkl
 *.safetensors

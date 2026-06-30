@@ -466,6 +466,8 @@ class CoDAGQAL:
                  rope: Optional[RoPE] = None):
         if n_heads % n_kv_heads != 0:
             raise ValueError("n_heads must be divisible by n_kv_heads")
+        if d_model % n_heads != 0:
+            raise ValueError("d_model must be divisible by n_heads")
         self.d_model, self.n_heads, self.n_kv_heads = d_model, n_heads, n_kv_heads
         self.d_head = d_model // n_heads
         self.kv_groups = n_heads // n_kv_heads

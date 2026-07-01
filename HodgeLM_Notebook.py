@@ -22,7 +22,7 @@
 
 
 # 1. Setup & dependencies
-import sys, subprocess
+import sys, subprocess, collections
 
 try:
     import safetensors
@@ -432,8 +432,9 @@ class RoPE:
         batch, seq, d = x.shape
         if seq + seq_offset > self.max_seq:
             raise ValueError(f"seq {seq}+{seq_offset} > max_seq {self.max_seq}")
-        sin = self.sin_table[seq_offset:seq_offset + seq]   # (seq, d/2)
-        cos = self.cos_table[seq_offset:seq_offset + seq]   # (seq, d/2)
+        half_d = d // 2
+        sin = self.sin_table[seq_offset:seq_offset + seq, :half_d]   # (seq, d/2)
+        cos = self.cos_table[seq_offset:seq_offset + seq, :half_d]   # (seq, d/2)
         x_even = x[..., 0::2]   # (batch, seq, d/2)
         x_odd  = x[..., 1::2]   # (batch, seq, d/2)
         out = np.zeros_like(x)
@@ -456,8 +457,8 @@ class CoDAGQAL:
     The landmark cache collects a running set of orthogonalised key vectors that
     can be used by future forward passes to augment the attention span beyond the
     current context window.  In this implementation the cache is populated each
-    call but not yet injected back into the attention computation; that extension
-    is left as a well-defined stub (see _attend_with_landmarks).
+    call and the cached landmarks are injected into the attention computation
+    (see _attend_with_landmarks).
     """
     log = StructuredLogger("CoDA-GQA-L")
 
@@ -524,7 +525,12 @@ class CoDAGQAL:
             self.ema_V = self.ema_decay * self.ema_V + (1 - self.ema_decay) * Vm
 
     def _attend_with_landmarks(self, Q_t, K1_t, K2_t, V_t):
-        """Augments attention with stored landmarks."""
+        """Augments attention with stored landmarks.
+
+        Landmarks are incorporated into the attention computation using the
+        existing tensor shapes, concatenation along the sequence axis, and
+        proper mask handling to preserve causality.
+        """
         batch, _, seq, _ = Q_t.shape
         lmc = int(np.asarray(self.landmark_count).item())
         if lmc == 0:
@@ -545,7 +551,7 @@ class CoDAGQAL:
         full_mask[:, lmc:] = mask
         return K1_full, K2_full, V_full, full_mask
 
-    def forward(self, x: np.ndarray, seq_offset: int = 0) -> np.ndarray:
+    def forward(self, x: np.ndarray, seq_offset: int = 0, update_landmarks: bool = True) -> np.ndarray:
         batch, seq, d = x.shape
         self.total_tokens_processed += batch * seq
 
@@ -563,10 +569,22 @@ class CoDAGQAL:
             # Q has shape (batch, seq, n_heads, d_head); reshape to
             # (batch, seq, n_heads*d_head) = (batch, seq, d_model) then rotate.
             Q_2d = Q.reshape(batch, seq, self.n_heads * self.d_head)
+            K1_2d = K1.reshape(batch, seq, self.n_kv_heads * self.d_head)
+            K2_2d = K2.reshape(batch, seq, self.n_kv_heads * self.d_head)
+
             Q_rot = np.stack([
                 self.rope.rotate(Q_2d[b], seq_offset) for b in range(batch)
             ])  # (batch, seq, d_model)
+            K1_rot = np.stack([
+                self.rope.rotate(K1_2d[b], seq_offset) for b in range(batch)
+            ])
+            K2_rot = np.stack([
+                self.rope.rotate(K2_2d[b], seq_offset) for b in range(batch)
+            ])
+
             Q = Q_rot.reshape(batch, seq, self.n_heads, self.d_head)
+            K1 = K1_rot.reshape(batch, seq, self.n_kv_heads, self.d_head)
+            K2 = K2_rot.reshape(batch, seq, self.n_kv_heads, self.d_head)
 
         # GQA: expand KV heads to match query heads.
         K1 = np.repeat(K1, self.kv_groups, axis=2)
@@ -592,20 +610,25 @@ class CoDAGQAL:
         diff = a1 - self.lambda_param * a2
         O = (diff @ V_full).transpose(0, 2, 1, 3)  # (batch, seq, heads, d_head)
 
-        # --- Landmark cache update ---
-        Kflat = K1_kv.reshape(batch * seq, -1)
-        Vflat = V_kv_orig.reshape(batch * seq, -1)
-        # Per-token importance = sum of attention mass over keys, mean over heads.
-        attn_mass = a1.sum(axis=-1).mean(axis=1).reshape(-1)  # (batch*seq,)
-        lmK, lmV = self._select_landmarks(Kflat, Vflat, attn_mass)
-        free = self.n_landmarks - int(np.asarray(self.landmark_count).item())
-        if free > 0:
-            n_new = min(len(lmK), free)
-            end = int(np.asarray(self.landmark_count).item()) + n_new
-            self.landmark_K[int(np.asarray(self.landmark_count).item()):end] = lmK[:n_new]
-            self.landmark_V[int(np.asarray(self.landmark_count).item()):end] = lmV[:n_new]
-            self.landmark_count = np.array(end, dtype=np.int32)
-        self._update_ema(Kflat, Vflat)
+        if update_landmarks:
+            # --- Landmark cache update ---
+            Kflat = K1_kv.reshape(batch * seq, -1)
+            Vflat = V_kv_orig.reshape(batch * seq, -1)
+            # Per-token importance = sum of attention mass over keys, mean over heads.
+            # a1 shape: (batch, heads, seq_q, lmc + seq_k)
+            # We want importance of current seq_k, which are the last `seq` elements.
+            lmc = int(np.asarray(self.landmark_count).item())
+            a1_k = a1[..., lmc:]  # (batch, heads, seq_q, seq_k)
+            attn_mass = a1_k.sum(axis=-2).mean(axis=1).reshape(-1)  # (batch*seq,)
+            lmK, lmV = self._select_landmarks(Kflat, Vflat, attn_mass)
+            free = self.n_landmarks - int(np.asarray(self.landmark_count).item())
+            if free > 0:
+                n_new = min(len(lmK), free)
+                end = int(np.asarray(self.landmark_count).item()) + n_new
+                self.landmark_K[int(np.asarray(self.landmark_count).item()):end] = lmK[:n_new]
+                self.landmark_V[int(np.asarray(self.landmark_count).item()):end] = lmV[:n_new]
+                self.landmark_count = np.array(end, dtype=np.int32)
+                self._update_ema(Kflat, Vflat)
 
         Of = O.reshape(batch * seq, self.n_heads * self.d_head)
         return (Of @ self.W_O).reshape(batch, seq, d)
@@ -776,8 +799,11 @@ class MoELayer:
         owners:  Dict[int, List] = defaultdict(list)
         for t in range(n_tok):
             for k in range(self.top_k):
-                e = int(idx[t, k]); w = float(wts[t, k])
-                inputs[e].append(xf[t]); weights[e].append(w); owners[e].append(t)
+                e = int(idx[t, k])
+                w = float(wts[t, k])
+                inputs[e].append(xf[t])
+                weights[e].append(w)
+                owners[e].append(t)
 
         loads = []
         for e in range(self.n_experts):
@@ -838,7 +864,7 @@ class MoELayer:
 
             # Accumulate expert input-gradient into the total.
             for i, t in enumerate(sel_tok):
-                dx_acc[t] += w_arr[i] * d_x[i]
+                dx_acc[t] += d_x[i]
 
             experts_grads[e].update(grads)
             experts_grads[e]["count"] = len(sel_tok)
@@ -1276,22 +1302,24 @@ class MetacognitiveTrainingLoop:
         x, y = self._sample_batch()
 
         # Forward pass: use step as deterministic seq_offset for training.
-        seq_off = self.step % cfg.max_seq
+        seq_off = self.step % max(1, cfg.max_seq - x.shape[1] + 1)
         attn_out = self.model.attention.forward(x, seq_offset=seq_off)
-        moe_out, aux, _ = self.model.moe.forward(attn_out)
+        ffn_out  = self.model.ffn.forward(attn_out)
+        moe_out, aux, _ = self.model.moe.forward(ffn_out)
         pred = moe_out
 
         loss, mse, aux_val, grad_out = self._compute_loss(pred, y, aux)
 
         grads: Dict[str, np.ndarray] = {}
 
+        # Backward through MoE.
+        moe_grad_in, moe_grads = self.model.moe.backward(ffn_out, grad_out)
+
         # Backward through FFN.
-        _, ffn_grads = self.model.ffn.backward(attn_out, grad_out)
+        _, ffn_grads = self.model.ffn.backward(attn_out, moe_grad_in)
         for k, v in ffn_grads.items():
             grads[f"ffn.{k}"] = v
 
-        # Backward through MoE.
-        _, moe_grads = self.model.moe.backward(attn_out, grad_out)
         for eid, eg in moe_grads.items():
             if eg["count"] == 0:
                 continue
@@ -1446,8 +1474,8 @@ class TrainableEngine:
 
     def get_param(self, name: str) -> np.ndarray:
         val = self._resolve(name)
-        if isinstance(val, (int, np.integer)):
-            return np.array([val], dtype=np.int32)
+        if isinstance(val, (int, np.integer)) or (isinstance(val, np.ndarray) and val.ndim == 0):
+            return np.array([int(val)], dtype=np.int32)
         return val.copy()
 
     def set_param(self, name: str, value: np.ndarray):
@@ -1459,6 +1487,8 @@ class TrainableEngine:
         if isinstance(last, str):
             # Validate shape before assignment to catch mismatched checkpoints.
             current = getattr(obj, last)
+            if name == "attn.landmark_count":
+                value = np.array(value.item(), dtype=np.int32)
             if hasattr(current, "shape") and current.shape != value.shape:
                 if name == "attn.landmark_count":
                     pass
@@ -1515,7 +1545,7 @@ class TrainableEngine:
             self.prng.restore_state(st)
 
     def forward(self, x: np.ndarray, seq_offset: Optional[int] = None,
-                return_extras: bool = False):
+                return_extras: bool = False, update_landmarks: bool = True):
         """Forward pass.
 
         Args:
@@ -1528,7 +1558,7 @@ class TrainableEngine:
         cfg = self.config
         if seq_offset is None:
             seq_offset = int(self.prng.randint(0, max(1, cfg.max_seq - x.shape[1])))
-        attn_out = self.attention.forward(x, seq_offset=seq_offset)
+        attn_out = self.attention.forward(x, seq_offset=seq_offset, update_landmarks=update_landmarks)
         ffn_out  = self.ffn.forward(attn_out)
         moe_out, aux, _ = self.moe.forward(ffn_out)
         if return_extras:
@@ -1611,8 +1641,12 @@ def export_safetensors(path: str, engine: "TrainableEngine",
     """Export all named parameters to a single .safetensors file."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tensors = {k: np.ascontiguousarray(v, dtype=np.float64)
-               for k, v in engine.named_parameters().items()}
+    tensors = {}
+    for k, v in engine.named_parameters().items():
+        if k == "attn.landmark_count":
+            tensors[k] = np.ascontiguousarray(v, dtype=np.int32)
+        else:
+            tensors[k] = np.ascontiguousarray(v, dtype=np.float64)
     meta: Dict[str, str] = {
         "format_version": SAFETENSORS_FORMAT_VERSION,
         "config": json.dumps(engine.config.to_dict()),
@@ -1695,6 +1729,23 @@ def train_engine(cfg: Optional[EngineConfig] = None,
     """Train the engine end-to-end with checkpointing and safetensors export."""
     # ----- initialise / restore -------------------------------------------
     if resume_from and Path(resume_from).exists():
+        # Validate that the resume_from path is within the trusted checkpoint_dir
+        # But wait, original code was:
+        # resume_from=str(Path(CKPT_DIR) / "final.pkl"),
+        # checkpoint_dir=str(Path(CKPT_DIR) / "resumed")
+        # In the demo code, resume_from is "artifacts/checkpoints/final.pkl"
+        # but checkpoint_dir is "artifacts/checkpoints/resumed".
+        # These are NOT relative to each other!
+        # So resolving against `checkpoint_dir` WILL fail the demo code!
+        # The demo code explicitly uses a different checkpoint_dir for the resumed run to avoid overwriting.
+        # We must validate it against `CKPT_DIR` itself, or just check if it's within `Path("artifacts/checkpoints").resolve()`.
+
+        # Let's validate it against a broader trusted root (like the parent of checkpoint_dir, or a configurable trusted root)
+        # We'll just validate against `Path(resume_from).parent.resolve()` or something, or better yet:
+        resolved_resume = Path(resume_from).resolve()
+        # Ensure it's not trying to escape to system paths.
+        if not str(resolved_resume).startswith(str(Path.cwd().resolve())):
+            raise ValueError(f"resume_from path '{resume_from}' is not within trusted cwd")
         cfg_ckpt, state, trainer_state, _ = load_checkpoint(resume_from)
         engine = TrainableEngine(cfg_ckpt)
         engine.load_state_dict(state)
@@ -1704,6 +1755,7 @@ def train_engine(cfg: Optional[EngineConfig] = None,
         start_step  = trainer_state.get("step", 0) if trainer_state else 0
         starting_lr = trainer_state.get("lr", 1e-3) if trainer_state else 1e-3
     else:
+        trainer_state = None
         cfg = cfg or EngineConfig()
         if seed is not None:
             cfg.seed = seed
@@ -1714,7 +1766,15 @@ def train_engine(cfg: Optional[EngineConfig] = None,
               f"({engine.num_parameters():,} params)")
 
     trainer = MetacognitiveTrainingLoop(engine, lr=starting_lr, seed=cfg.seed)
-    trainer.step = start_step
+    if trainer_state:
+        trainer.step = trainer_state.get("step", 0)
+        trainer.complete = trainer_state.get("complete", False)
+        trainer.state.loss_history = collections.deque(trainer_state.get("loss_history", []), maxlen=1000)
+        trainer.state.error_rates = collections.deque(trainer_state.get("error_rates", []), maxlen=1000)
+        trainer.state.aux_history = collections.deque(trainer_state.get("aux_history", []), maxlen=1000)
+        trainer.state.lr_history = collections.deque(trainer_state.get("lr_history", []), maxlen=1000)
+    else:
+        trainer.step = start_step
     print(f"[train] running {max_steps} steps from step {start_step}")
     history: List[Dict] = []
 
@@ -1782,7 +1842,7 @@ def run_inference(engine: "TrainableEngine", x: np.ndarray,
                   return_extras: bool = False):
     """Deterministic inference: uses seq_offset=0 by default so the output
     is reproducible regardless of the engine's internal PRNG state."""
-    return engine.forward(x, seq_offset=seq_offset, return_extras=return_extras)
+    return engine.forward(x, seq_offset=seq_offset, return_extras=return_extras, update_landmarks=False)
 
 
 def parity_check(engine_a: "TrainableEngine", engine_b: "TrainableEngine",
@@ -1793,8 +1853,8 @@ def parity_check(engine_a: "TrainableEngine", engine_b: "TrainableEngine",
     PRNG states (which would differ between a freshly-trained engine and one
     loaded from safetensors that doesn't store RNG state).
     """
-    a = engine_a.forward(x, seq_offset=seq_offset)
-    b = engine_b.forward(x, seq_offset=seq_offset)
+    a = engine_a.forward(x, seq_offset=seq_offset, update_landmarks=False)
+    b = engine_b.forward(x, seq_offset=seq_offset, update_landmarks=False)
     diff = float(np.max(np.abs(a - b)))
     return {"max_abs_diff": diff, "shape": list(a.shape), "match": diff < 1e-8}
 
@@ -1817,87 +1877,89 @@ def parity_check(engine_a: "TrainableEngine", engine_b: "TrainableEngine",
 # 24. End-to-end demonstration
 from pathlib import Path
 
-STEPS       = 40
-CKPT_EVERY  = 10
-LOG_EVERY   = 1
-CKPT_DIR    = "artifacts/checkpoints"
-SAFETENSORS = "artifacts/engine.safetensors"
+if __name__ == "__main__":
 
-# 1. Fresh build + train + checkpoint + safetensors export.
-result = train_engine(
-    cfg=EngineConfig(),
-    max_steps=STEPS,
-    checkpoint_every=CKPT_EVERY,
-    checkpoint_dir=CKPT_DIR,
-    safetensors_path=SAFETENSORS,
-    log_every=LOG_EVERY,
-    seed=2026,
-)
+    STEPS       = 40
+    CKPT_EVERY  = 10
+    LOG_EVERY   = 1
+    CKPT_DIR    = "artifacts/checkpoints"
+    SAFETENSORS = "artifacts/engine.safetensors"
 
-# 2. Inspect the safetensors file.
-print("\n--- safetensors inspection ---")
-info = inspect_safetensors(SAFETENSORS)
-print(f"path        : {info['path']}")
-print(f"tensors     : {len(info['tensors'])}")
-print(f"metadata    : {sorted(info['metadata'].keys())}")
-for name, meta in list(info['tensors'].items())[:6]:
-    print(f"  {name:<28s} shape={meta['shape']} dtype={meta['dtype']}")
-print(f"  ... ({len(info['tensors']) - 6} more tensors)")
+    # 1. Fresh build + train + checkpoint + safetensors export.
+    result = train_engine(
+        cfg=EngineConfig(),
+        max_steps=STEPS,
+        checkpoint_every=CKPT_EVERY,
+        checkpoint_dir=CKPT_DIR,
+        safetensors_path=SAFETENSORS,
+        log_every=LOG_EVERY,
+        seed=2026,
+    )
 
-# 3. Reload into a brand-new engine.
-loaded_engine = load_for_inference(SAFETENSORS)
+    # 2. Inspect the safetensors file.
+    print("\n--- safetensors inspection ---")
+    info = inspect_safetensors(SAFETENSORS)
+    print(f"path        : {info['path']}")
+    print(f"tensors     : {len(info['tensors'])}")
+    print(f"metadata    : {sorted(info['metadata'].keys())}")
+    for name, meta in list(info['tensors'].items())[:6]:
+        print(f"  {name:<28s} shape={meta['shape']} dtype={meta['dtype']}")
+    print(f"  ... ({len(info['tensors']) - 6} more tensors)")
 
-# 4. Round-trip parity check.
-# Both engines use seq_offset=0 so divergent PRNG states don't affect the result.
-print("\n--- parity check (trained vs reloaded) ---")
-test_x = np.random.RandomState(0).randn(2, 8, loaded_engine.config.d_model)
-parity = parity_check(result["engine"], loaded_engine, test_x, seq_offset=0)
-print(f"max |\u0394|      : {parity['max_abs_diff']:.2e}")
-print(f"output shape : {parity['shape']}")
-print(f"match        : {parity['match']}")
+    # 3. Reload into a brand-new engine.
+    loaded_engine = load_for_inference(SAFETENSORS)
 
-# 5. Show training summary.
-print("\n--- training summary ---")
-hist = result["history"]
-print(f"steps        : {len(hist)}")
-print(f"init loss    : {hist[0]['loss']:.6f}")
-print(f"final loss   : {hist[-1]['loss']:.6f}")
-print(f"loss delta   : {hist[-1]['loss'] - hist[0]['loss']:+.6f}")
-print(f"init err     : {hist[0]['error_rate']:.4f}")
-print(f"final err    : {hist[-1]['error_rate']:.4f}")
+    # 4. Round-trip parity check.
+    # Both engines use seq_offset=0 so divergent PRNG states don't affect the result.
+    print("\n--- parity check (trained vs reloaded) ---")
+    test_x = np.random.RandomState(0).randn(2, 8, loaded_engine.config.d_model)
+    parity = parity_check(result["engine"], loaded_engine, test_x, seq_offset=0)
+    print(f"max |\u0394|      : {parity['max_abs_diff']:.2e}")
+    print(f"output shape : {parity['shape']}")
+    print(f"match        : {parity['match']}")
 
-# 6. List checkpoint files on disk.
-print("\n--- checkpoint files ---")
-for p in sorted(Path(CKPT_DIR).glob("*.pkl")):
-    print(f"  {p.name:<24s} {p.stat().st_size:>8d} bytes")
+    # 5. Show training summary.
+    print("\n--- training summary ---")
+    hist = result["history"]
+    print(f"steps        : {len(hist)}")
+    print(f"init loss    : {hist[0]['loss']:.6f}")
+    print(f"final loss   : {hist[-1]['loss']:.6f}")
+    print(f"loss delta   : {hist[-1]['loss'] - hist[0]['loss']:+.6f}")
+    print(f"init err     : {hist[0]['error_rate']:.4f}")
+    print(f"final err    : {hist[-1]['error_rate']:.4f}")
 
-# 7. Demonstrate resume from final checkpoint.
-print("\n--- resume from final checkpoint + 5 extra steps ---")
-resumed = train_engine(
-    resume_from=str(Path(CKPT_DIR) / "final.pkl"),
-    max_steps=5,
-    checkpoint_every=5,
-    checkpoint_dir=str(Path(CKPT_DIR) / "resumed"),
-    safetensors_path="artifacts/engine_resumed.safetensors",
-    log_every=1,
-)
-print(f"resumed loss : {resumed['history'][0]['loss']:.6f}")
+    # 6. List checkpoint files on disk.
+    print("\n--- checkpoint files ---")
+    for p in sorted(Path(CKPT_DIR).glob("*.pkl")):
+        print(f"  {p.name:<24s} {p.stat().st_size:>8d} bytes")
+
+    # 7. Demonstrate resume from final checkpoint.
+    print("\n--- resume from final checkpoint + 5 extra steps ---")
+    resumed = train_engine(
+        resume_from=str(Path(CKPT_DIR) / "final.pkl"),
+        max_steps=5,
+        checkpoint_every=5,
+        checkpoint_dir=str(Path(CKPT_DIR) / "resumed"),
+        safetensors_path="artifacts/engine_resumed.safetensors",
+        log_every=1,
+    )
+    print(f"resumed loss : {resumed['history'][0]['loss']:.6f}")
 
 
-# ## What just happened
-#
-# - **Training** — a 30-step (configurable) loop running real forward + backward
-#   passes through SwiGLU, FFN residual, MoE routing and attention. Loss values
-#   are computed live, not faked.
-# - **Checkpointing** — every `CKPT_EVERY` steps the *full* state dict
-#   (parameters + RNG state + trainer state + LTL-verified history) is pickled
-#   to `artifacts/checkpoints/step_*.pkl`. Training is fully resumable.
-# - **Safetensors export** — the trained weights are written to a single
-#   `artifacts/engine.safetensors` file with a metadata header describing the
-#   architecture, version, training summary and parameter count.
-# - **Inference** — `import_safetensors` rebuilds an engine and loads the
-#   weights. A parity check confirms bit-exact reproduction of the forward
-#   pass on identical inputs.
-#
-# Tweak `EngineConfig` to change the architecture (d_model, n_heads,
-# n_experts, top_k, ...) and re-run the demo cell to retrain from scratch.
+    # ## What just happened
+    #
+    # - **Training** — a 30-step (configurable) loop running real forward + backward
+    #   passes through SwiGLU, FFN residual, MoE routing and attention. Loss values
+    #   are computed live, not faked.
+    # - **Checkpointing** — every `CKPT_EVERY` steps the *full* state dict
+    #   (parameters + RNG state + trainer state + LTL-verified history) is pickled
+    #   to `artifacts/checkpoints/step_*.pkl`. Training is fully resumable.
+    # - **Safetensors export** — the trained weights are written to a single
+    #   `artifacts/engine.safetensors` file with a metadata header describing the
+    #   architecture, version, training summary and parameter count.
+    # - **Inference** — `import_safetensors` rebuilds an engine and loads the
+    #   weights. A parity check confirms bit-exact reproduction of the forward
+    #   pass on identical inputs.
+    #
+    # Tweak `EngineConfig` to change the architecture (d_model, n_heads,
+    # n_experts, top_k, ...) and re-run the demo cell to retrain from scratch.

@@ -424,16 +424,24 @@ class RoPE:
         self.cos_table = np.cos(angles)   # (max_seq, d_model/2)
 
     def rotate(self, x: np.ndarray, seq_offset: int = 0) -> np.ndarray:
-        """Apply RoPE to x with shape (..., seq, d_model)."""
+        """Apply RoPE to x with shape (..., seq, d) where d <= d_model.
+
+        d may be narrower than d_model (e.g. GQA's smaller KV width); the
+        first d/2 frequency columns of the precomputed table are used, so
+        query and key projections share the same per-pair frequencies.
+        """
         squeeze = False
         if x.ndim == 2:
             x = x[np.newaxis]
             squeeze = True
         batch, seq, d = x.shape
+        if d > self.d_model:
+            raise ValueError(f"x last dim {d} exceeds RoPE d_model {self.d_model}")
         if seq + seq_offset > self.max_seq:
             raise ValueError(f"seq {seq}+{seq_offset} > max_seq {self.max_seq}")
-        sin = self.sin_table[seq_offset:seq_offset + seq]   # (seq, d/2)
-        cos = self.cos_table[seq_offset:seq_offset + seq]   # (seq, d/2)
+        half = d // 2
+        sin = self.sin_table[seq_offset:seq_offset + seq, :half]   # (seq, d/2)
+        cos = self.cos_table[seq_offset:seq_offset + seq, :half]   # (seq, d/2)
         x_even = x[..., 0::2]   # (batch, seq, d/2)
         x_odd  = x[..., 1::2]   # (batch, seq, d/2)
         out = np.zeros_like(x)
@@ -454,10 +462,11 @@ class CoDAGQAL:
     Attention: A = softmax(Q K1^T) - lambda * softmax(Q K2^T).
 
     The landmark cache collects a running set of orthogonalised key vectors that
-    can be used by future forward passes to augment the attention span beyond the
-    current context window.  In this implementation the cache is populated each
-    call but not yet injected back into the attention computation; that extension
-    is left as a well-defined stub (see _attend_with_landmarks).
+    are used by future forward passes to augment the attention span beyond the
+    current context window: each call prepends the cached landmarks to the
+    current-window keys/values (see _attend_with_landmarks) before scoring, so
+    later tokens can attend to a compressed summary of earlier context even
+    once it has fallen out of the window.
     """
     log = StructuredLogger("CoDA-GQA-L")
 
@@ -568,6 +577,29 @@ class CoDAGQAL:
             ])  # (batch, seq, d_model)
             Q = Q_rot.reshape(batch, seq, self.n_heads, self.d_head)
 
+            # RoPE must rotate Keys too -- the (Q . K) relative-position
+            # property depends on BOTH sides being rotated by their own
+            # absolute position; rotating only Q leaves the dot product with
+            # an unrotated K dependent purely on the query's absolute
+            # position, which discards RoPE's entire purpose. Keys are
+            # rotated here (their un-repeated, un-rotated copies were already
+            # saved above for landmark selection), before the GQA repeat, and
+            # use the same n_kv_heads*d_head width -- narrower than Q's
+            # d_model when n_kv_heads < n_heads -- which RoPE.rotate handles
+            # by slicing the shared frequency table to that width.
+            d_kv = self.n_kv_heads * self.d_head
+            K1_2d = K1.reshape(batch, seq, d_kv)
+            K1_rot = np.stack([
+                self.rope.rotate(K1_2d[b], seq_offset) for b in range(batch)
+            ])
+            K1 = K1_rot.reshape(batch, seq, self.n_kv_heads, self.d_head)
+
+            K2_2d = K2.reshape(batch, seq, d_kv)
+            K2_rot = np.stack([
+                self.rope.rotate(K2_2d[b], seq_offset) for b in range(batch)
+            ])
+            K2 = K2_rot.reshape(batch, seq, self.n_kv_heads, self.d_head)
+
         # GQA: expand KV heads to match query heads.
         K1 = np.repeat(K1, self.kv_groups, axis=2)
         K2 = np.repeat(K2, self.kv_groups, axis=2)
@@ -595,8 +627,15 @@ class CoDAGQAL:
         # --- Landmark cache update ---
         Kflat = K1_kv.reshape(batch * seq, -1)
         Vflat = V_kv_orig.reshape(batch * seq, -1)
-        # Per-token importance = sum of attention mass over keys, mean over heads.
-        attn_mass = a1.sum(axis=-1).mean(axis=1).reshape(-1)  # (batch*seq,)
+        # Per-token importance = attention mass RECEIVED by each key position,
+        # aggregated over queries then averaged over heads. Summing over the
+        # key axis (a1's last axis) instead would be a no-op: softmax already
+        # normalises each query's row to sum to ~1 regardless of which keys
+        # matter, so that reduction carries no signal about which tokens are
+        # actually attended to. lmc_now excludes the landmark columns since
+        # Kflat/Vflat only cover the current-window tokens.
+        lmc_now = int(np.asarray(self.landmark_count).item())
+        attn_mass = a1.sum(axis=2).mean(axis=1)[:, lmc_now:].reshape(-1)  # (batch*seq,)
         lmK, lmV = self._select_landmarks(Kflat, Vflat, attn_mass)
         free = self.n_landmarks - int(np.asarray(self.landmark_count).item())
         if free > 0:
@@ -776,8 +815,11 @@ class MoELayer:
         owners:  Dict[int, List] = defaultdict(list)
         for t in range(n_tok):
             for k in range(self.top_k):
-                e = int(idx[t, k]); w = float(wts[t, k])
-                inputs[e].append(xf[t]); weights[e].append(w); owners[e].append(t)
+                e = int(idx[t, k])
+                w = float(wts[t, k])
+                inputs[e].append(xf[t])
+                weights[e].append(w)
+                owners[e].append(t)
 
         loads = []
         for e in range(self.n_experts):
@@ -836,9 +878,11 @@ class MoELayer:
 
             d_x, grads = self.experts[e].backward(bx, weighted_gf)
 
-            # Accumulate expert input-gradient into the total.
+            # d_x is already scaled by w_arr (backward is linear in its upstream
+            # gradient and weighted_gf was pre-scaled by w_arr) -- do NOT scale
+            # again here, or the routing weight gets squared into the input grad.
             for i, t in enumerate(sel_tok):
-                dx_acc[t] += w_arr[i] * d_x[i]
+                dx_acc[t] += d_x[i]
 
             experts_grads[e].update(grads)
             experts_grads[e]["count"] = len(sel_tok)
@@ -1276,28 +1320,35 @@ class MetacognitiveTrainingLoop:
         x, y = self._sample_batch()
 
         # Forward pass: use step as deterministic seq_offset for training.
+        # Must mirror TrainableEngine.forward()'s graph (attn -> ffn -> moe);
+        # skipping the FFN here would mean its weights are never exercised by
+        # the forward pass at all, while still being updated with gradients
+        # below -- i.e. training on a signal disconnected from the model.
         seq_off = self.step % cfg.max_seq
         attn_out = self.model.attention.forward(x, seq_offset=seq_off)
-        moe_out, aux, _ = self.model.moe.forward(attn_out)
+        ffn_out = self.model.ffn.forward(attn_out)
+        moe_out, aux, _ = self.model.moe.forward(ffn_out)
         pred = moe_out
 
         loss, mse, aux_val, grad_out = self._compute_loss(pred, y, aux)
 
         grads: Dict[str, np.ndarray] = {}
 
-        # Backward through FFN.
-        _, ffn_grads = self.model.ffn.backward(attn_out, grad_out)
-        for k, v in ffn_grads.items():
-            grads[f"ffn.{k}"] = v
-
-        # Backward through MoE.
-        _, moe_grads = self.model.moe.backward(attn_out, grad_out)
+        # Backward through MoE first (it is the last op in the forward graph),
+        # then propagate its input-gradient back through the FFN block.
+        d_ffn_out, moe_grads = self.model.moe.backward(ffn_out, grad_out)
         for eid, eg in moe_grads.items():
             if eg["count"] == 0:
                 continue
             for k in ("W_gate", "W_up", "W_down", "gamma", "beta"):
                 if isinstance(eg[k], np.ndarray):
                     grads[f"moe.expert{eid}.{k}"] = eg[k] / max(eg["count"], 1)
+
+        # Backward through FFN using the gradient flowing back from MoE's input
+        # (not the top-level loss gradient -- FFN's output feeds MoE, not the loss).
+        _, ffn_grads = self.model.ffn.backward(attn_out, d_ffn_out)
+        for k, v in ffn_grads.items():
+            grads[f"ffn.{k}"] = v
 
         self._sgd_step(grads)
 

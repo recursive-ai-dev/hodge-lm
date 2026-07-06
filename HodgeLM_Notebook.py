@@ -443,6 +443,31 @@ class RoPE:
             out = out[0]
         return out
 
+    def rotate_inverse(self, x: np.ndarray, seq_offset: int = 0) -> np.ndarray:
+        """Adjoint (transpose) of `rotate`, for backpropagation.
+
+        Each rotated pair (2i, 2i+1) is produced by an orthogonal 2x2 rotation
+        matrix, whose adjoint equals its inverse: applying `rotate` with the
+        sign of sin flipped undoes the rotation exactly.
+        """
+        squeeze = False
+        if x.ndim == 2:
+            x = x[np.newaxis]
+            squeeze = True
+        batch, seq, d = x.shape
+        if seq + seq_offset > self.max_seq:
+            raise ValueError(f"seq {seq}+{seq_offset} > max_seq {self.max_seq}")
+        sin = self.sin_table[seq_offset:seq_offset + seq]
+        cos = self.cos_table[seq_offset:seq_offset + seq]
+        x_even = x[..., 0::2]
+        x_odd  = x[..., 1::2]
+        out = np.zeros_like(x)
+        out[..., 0::2] =  x_even * cos + x_odd * sin
+        out[..., 1::2] = -x_even * sin + x_odd * cos
+        if squeeze:
+            out = out[0]
+        return out
+
 
 # In[ ]:
 
@@ -453,11 +478,14 @@ class CoDAGQAL:
 
     Attention: A = softmax(Q K1^T) - lambda * softmax(Q K2^T).
 
-    The landmark cache collects a running set of orthogonalised key vectors that
-    can be used by future forward passes to augment the attention span beyond the
-    current context window.  In this implementation the cache is populated each
-    call but not yet injected back into the attention computation; that extension
-    is left as a well-defined stub (see _attend_with_landmarks).
+    The landmark cache collects a running set of orthogonalised key vectors
+    from past forward() calls and injects them back into every subsequent
+    forward pass by concatenating them onto the current K/V before the score
+    computation (see _attend_with_landmarks), extending the effective
+    attention span beyond the current context window. Landmarks are treated
+    as detached cache state during backward(): gradients do not flow into the
+    historical tokens that produced them, only into the current-step K/V/Q/O
+    projections.
     """
     log = StructuredLogger("CoDA-GQA-L")
 
@@ -490,6 +518,8 @@ class CoDAGQAL:
         self.ema_V = np.zeros(d_kv)
         self.ema_initialized = False
         self.total_tokens_processed = 0
+        # Populated by forward(), consumed by backward(); see backward() docstring.
+        self._cache: Optional[Dict] = None
 
     @staticmethod
     def _softmax(z: np.ndarray) -> np.ndarray:
@@ -579,6 +609,7 @@ class CoDAGQAL:
         K2_t = K2.transpose(0, 2, 3, 1)
         V_t  = V.transpose(0, 2, 1, 3)
 
+        lmc = int(np.asarray(self.landmark_count).item())
         K1_full, K2_full, V_full, mask = self._attend_with_landmarks(Q_t, K1_t, K2_t, V_t)
         s1 = (Q_t @ K1_full) * self.scale    # (batch, heads, seq, seq)
         s2 = (Q_t @ K2_full) * self.scale
@@ -591,6 +622,13 @@ class CoDAGQAL:
         a2 = self._softmax(s2)
         diff = a1 - self.lambda_param * a2
         O = (diff @ V_full).transpose(0, 2, 1, 3)  # (batch, seq, heads, d_head)
+
+        # Cache everything backward() needs. Captured before the landmark-cache
+        # mutation below so it reflects the lmc actually used in this forward.
+        self._cache = {
+            "Q_t": Q_t, "K1_full": K1_full, "K2_full": K2_full, "V_full": V_full,
+            "a1": a1, "a2": a2, "lmc": lmc, "seq_offset": seq_offset,
+        }
 
         # --- Landmark cache update ---
         Kflat = K1_kv.reshape(batch * seq, -1)
@@ -609,6 +647,94 @@ class CoDAGQAL:
 
         Of = O.reshape(batch * seq, self.n_heads * self.d_head)
         return (Of @ self.W_O).reshape(batch, seq, d)
+
+    def backward(self, x: np.ndarray, grad_out: np.ndarray) -> Tuple[np.ndarray, Dict]:
+        """Analytic backward pass through forward(), using values cached there.
+
+        Landmark K/V are treated as detached cache state (see class docstring):
+        gradient contributions to the landmark portion of the concatenated
+        K/V/scores are dropped rather than routed back into earlier steps.
+        """
+        if self._cache is None:
+            raise RuntimeError("CoDAGQAL.backward called before forward")
+        cache = self._cache
+        batch, seq, d = x.shape
+        H, Hkv, Dh, groups = self.n_heads, self.n_kv_heads, self.d_head, self.kv_groups
+        lmc = cache["lmc"]
+        Q_t, K1_full, K2_full, V_full = (cache["Q_t"], cache["K1_full"],
+                                         cache["K2_full"], cache["V_full"])
+        a1, a2 = cache["a1"], cache["a2"]
+        diff = a1 - self.lambda_param * a2
+
+        xf = x.reshape(batch * seq, d)
+
+        # --- Output projection: out = Of @ W_O ---
+        d_out_flat = grad_out.reshape(batch * seq, d)
+        Of = (diff @ V_full).transpose(0, 2, 1, 3).reshape(batch * seq, H * Dh)
+        dW_O = Of.T @ d_out_flat
+        d_O = (d_out_flat @ self.W_O.T).reshape(batch, seq, H, Dh).transpose(0, 2, 1, 3)
+
+        # --- O = diff @ V_full ---
+        d_diff = d_O @ V_full.transpose(0, 1, 3, 2)              # (batch, heads, seq, lmc+seq)
+        d_V_full = diff.transpose(0, 1, 3, 2) @ d_O              # (batch, heads, lmc+seq, d_head)
+        d_V_t = d_V_full[:, :, lmc:, :]                          # drop landmark grad
+
+        # --- diff = a1 - lambda * a2 ---
+        d_a1 = d_diff
+        d_a2 = -self.lambda_param * d_diff
+
+        # --- softmax backward: d_s = a * (d_a - sum(a * d_a, axis=-1)) ---
+        d_s1 = a1 * (d_a1 - np.sum(a1 * d_a1, axis=-1, keepdims=True))
+        d_s2 = a2 * (d_a2 - np.sum(a2 * d_a2, axis=-1, keepdims=True))
+
+        # --- s = scale * (Q_t @ K_full) + mask (mask is constant, no grad) ---
+        d_mm1 = d_s1 * self.scale
+        d_mm2 = d_s2 * self.scale
+        d_Q_t = d_mm1 @ K1_full.transpose(0, 1, 3, 2) + d_mm2 @ K2_full.transpose(0, 1, 3, 2)
+        d_K1_full = Q_t.transpose(0, 1, 3, 2) @ d_mm1
+        d_K2_full = Q_t.transpose(0, 1, 3, 2) @ d_mm2
+        d_K1_t = d_K1_full[..., lmc:]                            # drop landmark grad
+        d_K2_t = d_K2_full[..., lmc:]
+
+        # --- undo the (batch, heads, ...) <-> (batch, seq, heads, ...) transposes ---
+        d_Q  = d_Q_t.transpose(0, 2, 1, 3)                       # (batch, seq, heads, d_head)
+        d_K1 = d_K1_t.transpose(0, 3, 1, 2)                      # (batch, seq, heads, d_head)
+        d_K2 = d_K2_t.transpose(0, 3, 1, 2)
+        d_V  = d_V_t.transpose(0, 2, 1, 3)
+
+        # --- undo GQA repeat: sum gradient over each kv-head's query group ---
+        d_K1_kv = d_K1.reshape(batch, seq, Hkv, groups, Dh).sum(axis=3)
+        d_K2_kv = d_K2.reshape(batch, seq, Hkv, groups, Dh).sum(axis=3)
+        d_V_kv  = d_V.reshape(batch, seq, Hkv, groups, Dh).sum(axis=3)
+
+        # --- undo RoPE on Q (orthogonal rotation; adjoint == inverse) ---
+        if self.rope is not None:
+            d_Q_2d = d_Q.reshape(batch, seq, H * Dh)
+            d_Q_pre_2d = np.stack([
+                self.rope.rotate_inverse(d_Q_2d[b], cache["seq_offset"])
+                for b in range(batch)
+            ])
+            d_Q_pre = d_Q_pre_2d.reshape(batch, seq, H, Dh)
+        else:
+            d_Q_pre = d_Q
+
+        # --- linear projections: Q/K1/K2/V = xf @ W_* ---
+        d_Q_pre_flat = d_Q_pre.reshape(batch * seq, H * Dh)
+        d_K1_kv_flat = d_K1_kv.reshape(batch * seq, Hkv * Dh)
+        d_K2_kv_flat = d_K2_kv.reshape(batch * seq, Hkv * Dh)
+        d_V_kv_flat  = d_V_kv.reshape(batch * seq, Hkv * Dh)
+
+        dW_Q  = xf.T @ d_Q_pre_flat
+        dW_K1 = xf.T @ d_K1_kv_flat
+        dW_K2 = xf.T @ d_K2_kv_flat
+        dW_V  = xf.T @ d_V_kv_flat
+
+        dx_flat = (d_Q_pre_flat @ self.W_Q.T + d_K1_kv_flat @ self.W_K1.T
+                  + d_K2_kv_flat @ self.W_K2.T + d_V_kv_flat @ self.W_V.T)
+        dx = dx_flat.reshape(batch, seq, d)
+
+        return dx, {"W_Q": dW_Q, "W_K1": dW_K1, "W_K2": dW_K2,
+                    "W_V": dW_V, "W_O": dW_O}
 
 
 # In[ ]:
@@ -708,6 +834,8 @@ class MoERouter:
         self.W_router = rng.randn(d_model, n_experts) * math.sqrt(2.0 / d_model)
         self.expert_stats = [ExpertStats(i) for i in range(n_experts)]
         self.routing_history: List[Dict] = []
+        # Populated by route(), consumed by backward(); see backward() docstring.
+        self._cache: Optional[Dict] = None
 
     def route(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """Returns (top_k indices, normalised weights, auxiliary load-balance loss)."""
@@ -738,7 +866,59 @@ class MoERouter:
             self.expert_stats[i].routing_prob  = float(P[i])
         self.routing_history.append({"f": f_mean.copy(), "P": P.copy(),
                                      "aux_loss": aux})
+
+        # aux = aux_loss_coef * n_experts * dot(f_mean, P). f_mean is a hard
+        # (step-function) load indicator; per standard MoE load-balancing
+        # practice (Switch Transformer / GShard) it is treated as a detached
+        # constant, so d(aux)/d(probs) flows only through P = probs.mean(0):
+        # d(aux)/d(P_j) = aux_loss_coef * n_experts * f_mean[j], and
+        # d(P_j)/d(probs[t, j]) = 1/nt for every token t.
+        d_probs_aux = np.broadcast_to(
+            (self.aux_loss_coef * self.n_experts * f_mean) / nt, (nt, self.n_experts)
+        ).copy()
+        self._cache = {"probs": probs, "idx": idx, "d_probs_aux": d_probs_aux}
         return idx, wts, aux
+
+    def backward(self, x: np.ndarray, d_wts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Backward through route(). Returns (dx, dW_router).
+
+        `d_wts` is dLoss/d(wts) from the weighted expert-combination in
+        MoELayer, i.e. the gradient of the main task loss with respect to the
+        per-token top-k routing weights returned by the last route() call.
+        The auxiliary load-balance loss's gradient (via d_probs_aux, cached in
+        route()) is unconditionally added, since MetacognitiveTrainingLoop
+        always includes `+ aux` in the total loss with coefficient 1.
+
+        `dx` is the gradient flowing back through `logits = x @ W_router`
+        alone; the caller must add the separate gradient contribution from
+        the expert combination (bo depends on x too) to get the full dx.
+
+        The hard top-k selection itself (`idx`) is treated as fixed/
+        non-differentiable, consistent with standard discrete MoE routing:
+        only the continuous softmax probabilities at the selected indices
+        carry gradient.
+        """
+        if self._cache is None:
+            raise RuntimeError("MoERouter.backward called before route")
+        probs, idx, d_probs_aux = (self._cache["probs"], self._cache["idx"],
+                                   self._cache["d_probs_aux"])
+
+        top_p = np.take_along_axis(probs, idx, axis=-1)
+        denom = top_p.sum(-1, keepdims=True)
+        # wts = top_p / denom
+        d_top_p = (d_wts / denom
+                  - np.sum(d_wts * top_p, axis=-1, keepdims=True) / denom ** 2)
+
+        d_probs = d_probs_aux.copy()
+        existing = np.take_along_axis(d_probs, idx, axis=-1)
+        np.put_along_axis(d_probs, idx, existing + d_top_p, axis=-1)
+
+        # Softmax backward: d_z = probs * (d_probs - sum(probs * d_probs, -1)).
+        d_z = probs * (d_probs - np.sum(probs * d_probs, axis=-1, keepdims=True))
+        d_logits = d_z / self.temperature
+        dW_router = x.T @ d_logits
+        dx = d_logits @ self.W_router.T
+        return dx, dW_router
 
 
 class Expert(FFNBlock):
@@ -796,10 +976,13 @@ class MoELayer:
 
     def backward(self, x: np.ndarray,
                  grad_out: np.ndarray) -> Tuple[np.ndarray, Dict]:
-        """Approximate backward through the MoE layer.
+        """Backward through the MoE layer, including the router.
 
         Uses routing cached from the last forward() call so expert stats and
-        routing_history are not inflated by a second route() call.
+        routing_history are not inflated by a second route() call. The
+        router's gradient (main-task path through the combination weights,
+        plus the auxiliary load-balance loss) is returned under the
+        "router" key of the result dict as {"W_router": ...}.
         """
         if self._last_idx is None:
             raise RuntimeError("MoELayer.backward called before forward")
@@ -807,8 +990,19 @@ class MoELayer:
         n_tok = batch * seq
         xf  = x.reshape(n_tok, d)
         gf  = grad_out.reshape(n_tok, d)
-        idx = self._last_idx
-        wts = self._last_wts
+        idx = self._last_idx                                    # (n_tok, top_k)
+        wts = self._last_wts                                    # (n_tok, top_k)
+
+        # Precompute the token->expert routing map in O(n_tok * top_k), so the
+        # per-expert loop below doesn't re-scan all n_tok tokens for every
+        # expert (which would cost O(n_experts * n_tok * top_k)).
+        # tok_for_expert[e] = list of (token_idx, position within top_k).
+        tok_for_expert: Dict[int, List[Tuple[int, int]]] = {
+            e: [] for e in range(self.n_experts)
+        }
+        for t in range(n_tok):
+            for k in range(self.top_k):
+                tok_for_expert[int(idx[t, k])].append((t, k))
 
         experts_grads: Dict[int, Dict] = {
             e: {"W_gate": 0, "W_up": 0, "W_down": 0,
@@ -817,31 +1011,44 @@ class MoELayer:
         }
         # Accumulate input gradient (residual pass-through + FFN contributions).
         dx_acc = gf.copy()   # gradient from the residual skip connection
+        d_wts = np.zeros_like(wts)   # dLoss/d(routing weight), for the router
 
         for e in range(self.n_experts):
-            # Find tokens routed to this expert.
-            sel_tok = [t for t in range(n_tok) if e in idx[t]]
-            if not sel_tok:
+            entries = tok_for_expert[e]
+            if not entries:
                 continue
+            sel_tok = [t for t, _ in entries]
+            k_pos = np.array([k for _, k in entries])
             bx = xf[sel_tok]
-
-            # Routing weights for these tokens at expert e.
-            w_arr = np.array([
-                float(wts[t, int(np.where(idx[t] == e)[0][0])])
-                for t in sel_tok
-            ])                  # (n_sel,)
+            w_arr = wts[sel_tok, k_pos]   # (n_sel,)
 
             # Scale output gradient by routing weight.
             weighted_gf = gf[sel_tok] * w_arr[:, np.newaxis]   # (n_sel, d)
 
             d_x, grads = self.experts[e].backward(bx, weighted_gf)
 
-            # Accumulate expert input-gradient into the total.
+            # Routing-weight gradient: dLoss/dw = <upstream_grad, expert_output>,
+            # since out[t] = sum_k w_{t,k} * expert_k(x[t]).
+            bo = self.experts[e].forward(bx)
+            d_wts[sel_tok, k_pos] = np.sum(gf[sel_tok] * bo, axis=-1)
+
+            # Accumulate expert input-gradient into the total. d_x already
+            # carries the routing-weight factor: backward() is linear in its
+            # grad_out argument and weighted_gf = w * gf, so d_x = w * d(bo)/d(bx)
+            # already. Multiplying by w_arr again here would double-count it
+            # (an extra spurious factor of w), corrupting the FFN experts'
+            # upstream gradient.
             for i, t in enumerate(sel_tok):
-                dx_acc[t] += w_arr[i] * d_x[i]
+                dx_acc[t] += d_x[i]
 
             experts_grads[e].update(grads)
             experts_grads[e]["count"] = len(sel_tok)
+
+        # Router backward: adds the gradient path through logits = x @ W_router
+        # (routing weights depend on x too, not just the experts' own inputs).
+        dx_router, dW_router = self.router.backward(xf, d_wts)
+        dx_acc += dx_router
+        experts_grads["router"] = {"W_router": dW_router}
 
         return dx_acc.reshape(batch, seq, d), experts_grads
 
@@ -1209,6 +1416,25 @@ class TrainingState:
         self.aux_history.append(float(aux))
         self.lr_history.append(float(lr))
 
+    def to_dict(self) -> Dict:
+        return {
+            "loss_history": list(self.loss_history),
+            "step_history": list(self.step_history),
+            "error_rates":  list(self.error_rates),
+            "aux_history":  list(self.aux_history),
+            "lr_history":   list(self.lr_history),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "TrainingState":
+        ts = cls()
+        ts.loss_history = [float(x) for x in d.get("loss_history", [])]
+        ts.step_history = [int(x)   for x in d.get("step_history", [])]
+        ts.error_rates  = [float(x) for x in d.get("error_rates", [])]
+        ts.aux_history  = [float(x) for x in d.get("aux_history", [])]
+        ts.lr_history   = [float(x) for x in d.get("lr_history", [])]
+        return ts
+
     def verify_monotone(self, tol: float = 1e-6) -> bool:
         return LTLProperties.monotone_non_increase(self.error_rates, tol)
 
@@ -1276,28 +1502,44 @@ class MetacognitiveTrainingLoop:
         x, y = self._sample_batch()
 
         # Forward pass: use step as deterministic seq_offset for training.
+        # Mirrors TrainableEngine.forward()'s attention -> ffn -> moe order
+        # exactly, so the weights being optimised here are the same weights
+        # (and same computational graph) used at inference time.
         seq_off = self.step % cfg.max_seq
         attn_out = self.model.attention.forward(x, seq_offset=seq_off)
-        moe_out, aux, _ = self.model.moe.forward(attn_out)
+        ffn_out = self.model.ffn.forward(attn_out)
+        moe_out, aux, _ = self.model.moe.forward(ffn_out)
         pred = moe_out
 
         loss, mse, aux_val, grad_out = self._compute_loss(pred, y, aux)
 
         grads: Dict[str, np.ndarray] = {}
 
-        # Backward through FFN.
-        _, ffn_grads = self.model.ffn.backward(attn_out, grad_out)
-        for k, v in ffn_grads.items():
-            grads[f"ffn.{k}"] = v
-
-        # Backward through MoE.
-        _, moe_grads = self.model.moe.backward(attn_out, grad_out)
+        # Backward through MoE (last op in the forward chain).
+        d_moe_in, moe_grads = self.model.moe.backward(ffn_out, grad_out)
+        grads["moe.router.W_router"] = moe_grads["router"]["W_router"]
         for eid, eg in moe_grads.items():
-            if eg["count"] == 0:
+            if eid == "router" or eg["count"] == 0:
                 continue
             for k in ("W_gate", "W_up", "W_down", "gamma", "beta"):
                 if isinstance(eg[k], np.ndarray):
-                    grads[f"moe.expert{eid}.{k}"] = eg[k] / max(eg["count"], 1)
+                    # eg[k] is already the correctly-summed analytic gradient
+                    # (FFNBlock.backward sums over its batch dimension, and
+                    # grad_out is already normalised by the *global* batch
+                    # size upstream in _compute_loss). Dividing by this
+                    # expert's token count would apply a second, spurious
+                    # normalisation, shrinking busier experts' gradients.
+                    grads[f"moe.expert{eid}.{k}"] = eg[k]
+
+        # Backward through FFN, using MoE's upstream gradient (not grad_out).
+        d_ffn_in, ffn_grads = self.model.ffn.backward(attn_out, d_moe_in)
+        for k, v in ffn_grads.items():
+            grads[f"ffn.{k}"] = v
+
+        # Backward through attention, using FFN's upstream gradient.
+        _, attn_grads = self.model.attention.backward(x, d_ffn_in)
+        for k, v in attn_grads.items():
+            grads[f"attn.{k}"] = v
 
         self._sgd_step(grads)
 
@@ -1564,10 +1806,7 @@ def save_checkpoint(path: str, engine: "TrainableEngine",
             "step": trainer.step,
             "lr": trainer.lr,
             "complete": trainer.complete,
-            "loss_history": list(trainer.state.loss_history),
-            "error_rates": list(trainer.state.error_rates),
-            "aux_history": list(trainer.state.aux_history),
-            "lr_history": list(trainer.state.lr_history),
+            **trainer.state.to_dict(),
         }
     if extra:
         payload["extra"] = extra
@@ -1592,6 +1831,13 @@ def load_checkpoint(path: str) -> Tuple[
     """
     with open(path, "rb") as f:
         payload = pickle.load(f)
+    schema_version = payload.get("schema_version", 0)
+    if schema_version != 1:
+        warnings.warn(
+            f"Checkpoint at '{path}' has schema_version={schema_version} "
+            f"(expected 1); loading may fail or produce incorrect results.",
+            UserWarning, stacklevel=2,
+        )
     cfg_data = payload.get("config", {})
     cfg = EngineConfig(**{k: v for k, v in cfg_data.items()
                           if k in EngineConfig.__dataclass_fields__})
@@ -1715,6 +1961,13 @@ def train_engine(cfg: Optional[EngineConfig] = None,
 
     trainer = MetacognitiveTrainingLoop(engine, lr=starting_lr, seed=cfg.seed)
     trainer.step = start_step
+    if resume_from and trainer_state:
+        # Restore the full loss/error/aux/lr history too, not just step/lr,
+        # so LTL checks and metrics stay continuous across the resume point
+        # (the checkpoint already stores this; previously it was saved but
+        # never read back).
+        trainer.state = TrainingState.from_dict(trainer_state)
+        trainer.complete = trainer_state.get("complete", False)
     print(f"[train] running {max_steps} steps from step {start_step}")
     history: List[Dict] = []
 

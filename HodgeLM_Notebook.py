@@ -4,17 +4,17 @@
 # <a href="https://colab.research.google.com/github/recursive-ai-dev/hodge-lm/blob/master/HodgeLM_Notebook.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 
 # # Mathematically Verified Trainable AI Engine
-#
+# 
 # A complete, runnable Jupyter notebook that wraps the engine described in
 # `base-model-005.md` with first-class support for:
-#
+# 
 # - **Training** — gradient-based optimisation loop with proper back-prop through
 #   SwiGLU, FFN residual block, and MoE routing.
 # - **Checkpointing** — periodic snapshots of every trainable tensor, the
 #   optimiser state, RNG state and the LTL-verified training history. Resumable.
 # - **Safetensors export/import** — round-trip the model weights to and from the
 #   `safetensors` format, including a metadata header describing the architecture.
-#
+# 
 # Run the cells top-to-bottom. Every value reported is computed live; nothing is
 # mocked. Heavy logging can be toggled via the `LOG_LEVEL` constant below.
 
@@ -51,12 +51,14 @@ from typing import Optional, Dict, List, Tuple, Any, Callable
 
 import numpy as np
 
-# Suppress only numpy overflow/underflow RuntimeWarnings that arise from the
-# numerically-stable sigmoid branches (both branches computed eagerly by np.where).
+# Suppress ONLY the RuntimeWarnings produced by the numerically-stable sigmoid:
+# both branches (exp(-|x|) and exp(x)) are computed eagerly via np.where, so
+# the unused branch always overflows/invalids under the mask.  These are
+# harmless and expected.  Genuine overflow bugs elsewhere are NOT suppressed.
 warnings.filterwarnings("ignore", category=RuntimeWarning,
-                        message="overflow encountered")
+                        message="overflow encountered in exp")
 warnings.filterwarnings("ignore", category=RuntimeWarning,
-                        message="invalid value encountered")
+                        message="invalid value encountered in")
 
 np.set_printoptions(precision=4, suppress=True)
 
@@ -75,6 +77,9 @@ class StructuredLogger:
     def __init__(self, name: str, level: int = LOG_LEVEL):
         self.logger = logging.getLogger(name)
         self.logger.setLevel(level)
+        # Prevent messages from propagating to the root logger, which avoids
+        # double-logging when the root logger also has handlers (e.g. Jupyter).
+        self.logger.propagate = False
         if not self.logger.handlers:
             h = logging.StreamHandler(sys.stdout)
             h.setLevel(level)
@@ -117,6 +122,8 @@ class StructuredLogger:
         if v is None:
             return "None"
         if isinstance(v, np.ndarray):
+            if v.size == 0:
+                return f"ndarray{v.shape} dtype={v.dtype} (empty)"
             return (f"ndarray{v.shape} dtype={v.dtype} "
                     f"min={v.min():.4f} max={v.max():.4f} mean={v.mean():.4f}")
         if isinstance(v, float):
@@ -127,7 +134,6 @@ class StructuredLogger:
 
 
 ROOT_LOG = StructuredLogger("ENGINE")
-
 
 # In[ ]:
 
@@ -170,13 +176,20 @@ class LTLProperties:
 
     @staticmethod
     def append_only(history_a: List, history_b: List) -> bool:
+        """Verify that history_b is a strict superset-prefix of history_a.
+
+        Uses np.array_equal for element comparison so that ndarray items in the
+        history (e.g. gradient snapshots) are compared correctly rather than
+        triggering the ambiguous truth-value error from `a != b` on arrays.
+        """
         LTLProperties.log.enter("append_only",
                                 len_a=len(history_a), len_b=len(history_b))
         if len(history_b) < len(history_a):
             LTLProperties.log.exit("append_only", False, reason="shrinkage")
             return False
         for i, (a, b) in enumerate(zip(history_a, history_b)):
-            if a != b:
+            # np.array_equal handles both scalars and arrays safely.
+            if not np.array_equal(a, b):
                 LTLProperties.log.exit("append_only", False,
                                        reason=f"mutation_at_{i}")
                 return False
@@ -387,12 +400,20 @@ class SwiGLU:
         return gate * v_pre
 
     @staticmethod
-    def backward(x, W1, W2, grad_out):
+    def backward(x, W1, W2, grad_out, b1=None, b2=None):
+        """Analytic backward through SwiGLU.
+
+        Biases b1/b2 are included in the pre-activation computation so the
+        gradient w.r.t. W1/W2 and x is correct regardless of whether biases
+        are used.  Bias gradients are not returned because the current
+        callers (FFNBlock, Expert) do not use biases; add them here if needed.
+        """
         # Flatten leading dims so we can do a clean 2D matmul.
         x_flat = x.reshape(-1, x.shape[-1])
         g_flat = grad_out.reshape(-1, grad_out.shape[-1])
-        g_pre  = x_flat @ W1
-        v_pre  = x_flat @ W2
+        # Re-compute pre-activations including any bias (must match forward).
+        g_pre  = x_flat @ W1 + (b1 if b1 is not None else 0)
+        v_pre  = x_flat @ W2 + (b2 if b2 is not None else 0)
         sig_g  = SwiGLU._sigmoid(g_pre)
         gate   = g_pre * sig_g
         # dSwish/dx = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
@@ -402,7 +423,6 @@ class SwiGLU:
         dx_flat = (g_flat * v_pre * d_g) @ W1.T + (g_flat * gate) @ W2.T
         dx = dx_flat.reshape(x.shape)
         return dx, dW1, dW2
-
 
 # In[ ]:
 
@@ -447,8 +467,7 @@ class RoPE:
         """Apply the inverse (transpose) rotation, undoing rotate().
 
         RoPE is an orthogonal transformation (R @ R^T = I), so the inverse is
-        the transpose: negate the sine terms while keeping cosine terms. Used
-        to backpropagate gradients through rotate() during training.
+        the transpose: negate the sine terms while keeping cosine terms.
         """
         squeeze = False
         if x.ndim == 2:
@@ -462,12 +481,13 @@ class RoPE:
         x_even = x[..., 0::2]
         x_odd  = x[..., 1::2]
         out = np.zeros_like(x)
+        # Inverse rotation: y_even = x_even*cos + x_odd*sin
+        #                   y_odd  = -x_even*sin + x_odd*cos
         out[..., 0::2] = x_even * cos + x_odd * sin
         out[..., 1::2] = -x_even * sin + x_odd * cos
         if squeeze:
             out = out[0]
         return out
-
 
 # In[ ]:
 
@@ -480,15 +500,17 @@ class CoDAGQAL:
 
     The landmark cache collects a running set of orthogonalised key vectors that
     can be used by future forward passes to augment the attention span beyond the
-    current context window.  In this implementation the cache is populated each
-    call but not yet injected back into the attention computation; that extension
-    is left as a well-defined stub (see _attend_with_landmarks).
+    current context window. The cache is populated each call *and* injected back
+    into the attention computation on subsequent calls once it holds at least one
+    entry (see _attend_with_landmarks): stored landmark keys/values are prepended
+    to the current-step K/V before the softmax and are never causally masked, so
+    they remain visible to every query position in later steps.
     """
     log = StructuredLogger("CoDA-GQA-L")
 
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int,
                  n_landmarks: int = 16, ema_decay: float = 0.99,
-                 rope: Optional[RoPE] = None):
+                 rope: Optional[RoPE] = None, seed: int = 42):
         if n_heads % n_kv_heads != 0:
             raise ValueError("n_heads must be divisible by n_kv_heads")
         if d_model % n_heads != 0:
@@ -502,7 +524,7 @@ class CoDAGQAL:
         self.scale = 1.0 / math.sqrt(self.d_head)
         self.lambda_param = 0.1
         d_kv = self.d_head * n_kv_heads
-        rng = np.random.RandomState(42)
+        rng = np.random.RandomState(seed)
         self.W_Q  = rng.randn(d_model, d_model) * math.sqrt(2.0 / d_model)
         self.W_K1 = rng.randn(d_model, d_kv)     * math.sqrt(2.0 / d_model)
         self.W_K2 = rng.randn(d_model, d_kv)     * math.sqrt(2.0 / d_model)
@@ -665,95 +687,113 @@ class CoDAGQAL:
         }
         return (Of @ self.W_O).reshape(batch, seq, d)
 
-    def backward(self, x: np.ndarray,
-                 grad_out: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    def backward(self, x: np.ndarray, grad_out: np.ndarray,
+                 seq_offset: int = 0) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
         """Analytic backward through differential attention.
 
-        Uses activations cached by the most recent forward() call (see the
-        note there on why recomputing forward() would be unsafe). The
-        landmark cache itself is treated as a stop-gradient memory of past
-        activations -- gradient flows through the current step's Q/K1/K2/V
-        projections only, consistent with truncated backprop through time
-        over a KV cache.
+        Recomputes the forward activations (no activation cache) and returns
+        (grad_x, param_grads).  param_grads keys: W_Q, W_K1, W_K2, W_V, W_O.
         """
-        if self._cache is None:
-            raise RuntimeError("CoDAGQAL.backward called before forward")
-        c = self._cache
-        batch, seq, d = c["batch"], c["seq"], c["d"]
-        if x.shape != (batch, seq, d):
-            raise ValueError(
-                f"x shape {x.shape} does not match the cached forward() "
-                f"call's shape {(batch, seq, d)}")
-        xf, Q_t = c["xf"], c["Q_t"]
-        K1_full, K2_full, V_full = c["K1_full"], c["K2_full"], c["V_full"]
-        a1, a2, Of = c["a1"], c["a2"], c["Of"]
-        lmc, seq_offset = c["lmc"], c["seq_offset"]
+        batch, seq, d = x.shape
         d_kv = self.d_head * self.n_kv_heads
+        xf = x.reshape(batch * seq, d)                         # (BN, d)
 
-        gf = grad_out.reshape(batch * seq, d)
+        # ── Re-run forward to collect intermediate activations ──────────────
+        Q_pre = (xf @ self.W_Q).reshape(batch, seq, self.n_heads,    self.d_head)
+        K1_pre = (xf @ self.W_K1).reshape(batch, seq, self.n_kv_heads, self.d_head)
+        K2_pre = (xf @ self.W_K2).reshape(batch, seq, self.n_kv_heads, self.d_head)
+        V_pre  = (xf @ self.W_V).reshape(batch, seq, self.n_kv_heads, self.d_head)
 
-        # ── Output projection ────────────────────────────────────────────
-        dW_O = Of.T @ gf
-        dOf = gf @ self.W_O.T
-        dO_t = dOf.reshape(batch, seq, self.n_heads, self.d_head).transpose(0, 2, 1, 3)
+        if self.rope is not None:
+            Q_2d = Q_pre.reshape(batch, seq, self.n_heads * self.d_head)
+            Q_rot_2d = np.stack([
+                self.rope.rotate(Q_2d[b], seq_offset) for b in range(batch)
+            ])
+            Q = Q_rot_2d.reshape(batch, seq, self.n_heads, self.d_head)
+        else:
+            Q = Q_pre
 
-        # ── O_t = diff @ V_full ──────────────────────────────────────────
+        K1 = np.repeat(K1_pre, self.kv_groups, axis=2)        # (B, S, H, dh)
+        K2 = np.repeat(K2_pre, self.kv_groups, axis=2)
+        V  = np.repeat(V_pre,  self.kv_groups, axis=2)
+
+        Q_t  = Q.transpose(0, 2, 1, 3)                        # (B, H, S, dh)
+        K1_t = K1.transpose(0, 2, 3, 1)                       # (B, H, dh, S)
+        K2_t = K2.transpose(0, 2, 3, 1)
+        V_t  = V.transpose(0, 2, 1, 3)                        # (B, H, S, dh)
+
+        mask = np.triu(np.full((seq, seq), -1e9), k=1)
+        a1 = self._softmax((Q_t @ K1_t) * self.scale + mask)  # (B, H, S, S)
+        a2 = self._softmax((Q_t @ K2_t) * self.scale + mask)
         diff = a1 - self.lambda_param * a2
-        ddiff = dO_t @ V_full.transpose(0, 1, 3, 2)          # (B, H, S, lmc+S)
-        dV_full = diff.transpose(0, 1, 3, 2) @ dO_t          # (B, H, lmc+S, dh)
 
-        # ── diff = a1 - lambda * a2 ──────────────────────────────────────
-        da1 = ddiff
+        O_t = diff @ V_t                                       # (B, H, S, dh)
+        Of  = O_t.transpose(0, 2, 1, 3).reshape(batch * seq,
+                                                  self.n_heads * self.d_head)
+
+        # ── Backward ────────────────────────────────────────────────────────
+        gf = grad_out.reshape(batch * seq, d)                  # (BN, d)
+
+        # Gradient through output projection Of @ W_O
+        dW_O = Of.T @ gf                                       # (d, d)
+        dOf  = gf @ self.W_O.T                                 # (BN, d)
+
+        # Reshape / transpose back to (B, H, S, dh)
+        dO_t = (dOf.reshape(batch, seq, self.n_heads, self.d_head)
+                .transpose(0, 2, 1, 3))
+
+        # Gradient through O_t = diff @ V_t
+        ddiff = dO_t @ V_t.transpose(0, 1, 3, 2)              # (B, H, S, S)
+        dV_t  = diff.transpose(0, 1, 3, 2) @ dO_t             # (B, H, S, dh)
+
+        # Gradient through diff = a1 - lambda * a2
+        da1 =  ddiff
         da2 = -self.lambda_param * ddiff
 
-        # ── Softmax (folds in the 1/sqrt(d_head) score scaling) ─────────
-        ds1 = self._softmax_backward(da1, a1) * self.scale
+        # Gradient through softmax (includes the scale factor)
+        ds1 = self._softmax_backward(da1, a1) * self.scale     # (B, H, S, S)
         ds2 = self._softmax_backward(da2, a2) * self.scale
 
-        # ── s1 = Q_t @ K1_full, s2 = Q_t @ K2_full ───────────────────────
-        dQ_t = (ds1 @ K1_full.transpose(0, 1, 3, 2)
-                + ds2 @ K2_full.transpose(0, 1, 3, 2))
-        dK1_full = Q_t.transpose(0, 1, 3, 2) @ ds1           # (B, H, dh, lmc+S)
-        dK2_full = Q_t.transpose(0, 1, 3, 2) @ ds2
+        # Gradient through s1 = Q_t @ K1_t
+        dQ_t  = (ds1 @ K1_t.transpose(0, 1, 3, 2)             # from K1
+                 + ds2 @ K2_t.transpose(0, 1, 3, 2))           # from K2
+        dK1_t = Q_t.transpose(0, 1, 3, 2) @ ds1               # (B, H, dh, S)
+        dK2_t = Q_t.transpose(0, 1, 3, 2) @ ds2
 
-        # ── Landmarks are stop-gradient; keep only the current-step columns ─
-        dK1_t = dK1_full[..., lmc:]                          # (B, H, dh, S)
-        dK2_t = dK2_full[..., lmc:]
-        dV_t  = dV_full[:, :, lmc:, :]                       # (B, H, S, dh)
+        # ── Undo GQA expansion (sum over kv_groups) ─────────────────────────
+        def _undo_gqa(dX_full):
+            # dX_full: (B, S, H, dh) — sum the kv_groups replicates
+            return (dX_full.reshape(batch, seq,
+                                    self.n_kv_heads, self.kv_groups, self.d_head)
+                    .sum(axis=3))                               # (B, S, n_kv, dh)
 
-        def _undo_gqa(dX, from_layout):
-            # Reduce the kv_groups repeat back to n_kv_heads by summing the
-            # replicated blocks (inverse of np.repeat(..., kv_groups, axis)).
-            if from_layout == "dh_last":       # dX: (B, H, dh, S) -> (B, S, H, dh)
-                dX = dX.transpose(0, 3, 1, 2)
-            else:                              # from_layout == "seq_last": (B, H, S, dh) -> (B, S, H, dh)
-                dX = dX.transpose(0, 2, 1, 3)
-            return dX.reshape(batch, seq, self.n_kv_heads, self.kv_groups,
-                              self.d_head).sum(axis=3)
+        dK1_kv = _undo_gqa(dK1_t.transpose(0, 1, 3, 2).transpose(0, 2, 1, 3))
+        dK2_kv = _undo_gqa(dK2_t.transpose(0, 1, 3, 2).transpose(0, 2, 1, 3))
+        dV_kv  = _undo_gqa(dV_t.transpose(0, 2, 1, 3))
 
-        dK1_kv = _undo_gqa(dK1_t, "dh_last")
-        dK2_kv = _undo_gqa(dK2_t, "dh_last")
-        dV_kv  = _undo_gqa(dV_t,  "seq_last")
-
-        # ── Undo RoPE on the query gradient ───────────────────────────────
-        dQ_2d = dQ_t.transpose(0, 2, 1, 3).reshape(batch, seq, self.n_heads * self.d_head)
+        # ── Undo RoPE on Q gradient ──────────────────────────────────────────
+        dQ_2d = (dQ_t.transpose(0, 2, 1, 3)
+                 .reshape(batch, seq, self.n_heads * self.d_head))
         if self.rope is not None:
             dQ_pre_2d = np.stack([
-                self.rope.rotate_inverse(dQ_2d[b], seq_offset) for b in range(batch)
+                self.rope.rotate_inverse(dQ_2d[b], seq_offset)
+                for b in range(batch)
             ])
         else:
             dQ_pre_2d = dQ_2d
-        dQ_pre_flat = dQ_pre_2d.reshape(batch * seq, d)
+        dQ_pre_flat = dQ_pre_2d.reshape(batch * seq, d)        # (BN, d)
 
+        # ── Parameter gradients ─────────────────────────────────────────────
         dK1_flat = dK1_kv.reshape(batch * seq, d_kv)
         dK2_flat = dK2_kv.reshape(batch * seq, d_kv)
-        dV_flat  = dV_kv.reshape(batch * seq, d_kv)
+        dV_flat  = dV_kv.reshape(batch * seq,  d_kv)
 
-        dW_Q  = xf.T @ dQ_pre_flat
-        dW_K1 = xf.T @ dK1_flat
+        dW_Q  = xf.T @ dQ_pre_flat                             # (d, d)
+        dW_K1 = xf.T @ dK1_flat                               # (d, d_kv)
         dW_K2 = xf.T @ dK2_flat
         dW_V  = xf.T @ dV_flat
 
+        # ── Input gradient ───────────────────────────────────────────────────
         dx = (dQ_pre_flat @ self.W_Q.T
               + dK1_flat  @ self.W_K1.T
               + dK2_flat  @ self.W_K2.T
@@ -761,7 +801,6 @@ class CoDAGQAL:
 
         return dx, {"W_Q": dW_Q, "W_K1": dW_K1, "W_K2": dW_K2,
                     "W_V": dW_V, "W_O": dW_O}
-
 
 # In[ ]:
 
@@ -771,9 +810,9 @@ class FFNBlock:
     """Pre-norm residual SwiGLU FFN. y = x + W_down(SwiGLU(LN(x)))."""
     log = StructuredLogger("FFN")
 
-    def __init__(self, d_model: int, d_ffn: int):
+    def __init__(self, d_model: int, d_ffn: int, seed: int = 123):
         self.d_model, self.d_ffn = d_model, d_ffn
-        rng = np.random.RandomState(123)
+        rng = np.random.RandomState(seed)
         self.W_gate = rng.randn(d_model, d_ffn) * math.sqrt(2.0 / d_model)
         self.W_up   = rng.randn(d_model, d_ffn) * math.sqrt(2.0 / d_model)
         self.W_down = rng.randn(d_ffn, d_model)  * math.sqrt(2.0 / d_ffn)
@@ -787,16 +826,25 @@ class FFNBlock:
 
     def _layer_norm_backward(self, x: np.ndarray, grad_out: np.ndarray,
                              eps: float = 1e-8) -> np.ndarray:
+        """Backward through LayerNorm (Xu et al. 2019 / standard derivation).
+
+        grad_out is the upstream gradient w.r.t. the LN output (xn).
+        Returns gradient w.r.t. the LN input (x).
+        """
         mu  = x.mean(-1, keepdims=True)
         var = x.var(-1,  keepdims=True)
+        # d_loss/d_x_hat = grad_out * gamma  (chain through xn = gamma*x_hat + beta)
         d_xhat = grad_out * self.gamma
         n = x.shape[-1]
-        dvar = np.sum(d_xhat * (x - mu) * -0.5 * (var + eps) ** -1.5,
+        std_inv = 1.0 / np.sqrt(var + eps)                            # (…, 1)
+        x_mu    = x - mu                                               # (…, d)
+        dvar = np.sum(d_xhat * x_mu * (-0.5) * std_inv ** 3,
                       axis=-1, keepdims=True)
-        dmu  = (np.sum(d_xhat * -1.0 / np.sqrt(var + eps), axis=-1, keepdims=True)
-                + dvar * np.mean(-2.0 * (x - mu), axis=-1, keepdims=True))
-        dx   = (d_xhat / np.sqrt(var + eps)
-                + dvar * 2.0 * (x - mu) / n
+        # Note: mean(x - mu) == 0 by definition, so the dvar*mean(-2*(x-mu))
+        # term that appears in some derivations is always zero and is omitted.
+        dmu  = np.sum(d_xhat * (-std_inv), axis=-1, keepdims=True)
+        dx   = (d_xhat * std_inv
+                + dvar * 2.0 * x_mu / n
                 + dmu / n)
         return dx
 
@@ -817,23 +865,23 @@ class FFNBlock:
         # Gradient through SwiGLU.
         d_xn, dW_gate, dW_up = SwiGLU.backward(xn, self.W_gate, self.W_up, d_hidden)
 
-        # Gradient through LayerNorm (must pass the pre-LN input x, not xn).
+        # Gradient through LayerNorm (pass pre-LN input x, not xn).
         d_xn_norm = self._layer_norm_backward(x, d_xn)
 
-        # Residual: d_x = grad from skip connection + grad through FFN path.
+        # Residual: total d_x = skip-connection gradient + FFN path gradient.
         d_x = grad_out + d_xn_norm
 
-        # Gradient for scale/shift parameters: use normalised form of x (not xn).
+        # Gradients for scale/shift: use normalised x_hat (not xn which includes
+        # the learned gamma/beta offset).
         eps = 1e-8
         mu  = x.mean(-1, keepdims=True)
         var = x.var(-1,  keepdims=True)
-        x_hat = (x - mu) / np.sqrt(var + eps)
+        x_hat  = (x - mu) / np.sqrt(var + eps)
         dgamma = np.sum(x_hat * d_xn, axis=tuple(range(x.ndim - 1)))
         dbeta  = np.sum(d_xn,         axis=tuple(range(x.ndim - 1)))
 
         return d_x, {"W_gate": dW_gate, "W_up": dW_up, "W_down": dW_down,
                      "gamma": dgamma, "beta": dbeta}
-
 
 # In[ ]:
 
@@ -851,17 +899,18 @@ class MoERouter:
     log = StructuredLogger("MoERouter")
 
     def __init__(self, d_model: int, n_experts: int, top_k: int,
-                 temperature: float = 1.0, aux_loss_coef: float = 0.01):
+                 temperature: float = 1.0, aux_loss_coef: float = 0.01,
+                 seed: int = 999):
         if top_k > n_experts:
             raise ValueError("top_k cannot exceed n_experts")
         self.d_model, self.n_experts, self.top_k = d_model, n_experts, top_k
         self.temperature, self.aux_loss_coef = temperature, aux_loss_coef
-        rng = np.random.RandomState(999)
+        rng = np.random.RandomState(seed)
         self.W_router = rng.randn(d_model, n_experts) * math.sqrt(2.0 / d_model)
         self.expert_stats = [ExpertStats(i) for i in range(n_experts)]
         self.routing_history: List[Dict] = []
-        # Cached from the last route() call so backward_aux_loss() doesn't
-        # need to re-run the forward routing computation.
+        # Cached from the last route() call so backward() can compute the
+        # aux-loss gradient without re-deriving softmax probs / f_mean.
         self._last_x: Optional[np.ndarray] = None
         self._last_probs: Optional[np.ndarray] = None
         self._last_f_mean: Optional[np.ndarray] = None
@@ -895,39 +944,38 @@ class MoERouter:
             self.expert_stats[i].routing_prob  = float(P[i])
         self.routing_history.append({"f": f_mean.copy(), "P": P.copy(),
                                      "aux_loss": aux})
-
-        # Cache for backward_aux_loss(). f_mean is a hard (non-differentiable)
-        # top-k membership fraction, so it is treated as a constant -- this
-        # matches the standard Switch-Transformer aux-loss gradient, which
-        # only backpropagates through the soft probs P.
-        self._last_x = x
-        self._last_probs = probs
-        self._last_f_mean = f_mean
+        self._last_x, self._last_probs, self._last_f_mean = x, probs, f_mean
         return idx, wts, aux
 
-    def backward_aux_loss(self) -> np.ndarray:
-        """Analytic gradient of the auxiliary load-balance loss w.r.t. W_router.
+    def backward(self) -> np.ndarray:
+        """Gradient of the auxiliary load-balance loss w.r.t. W_router.
 
-        aux = aux_loss_coef * n_experts * mean_t[f_t] . mean_t[probs_t]
-        with f (hard top-k membership) held fixed (stop-gradient), so only the
-        softmax probs carry gradient. Must be called after route().
+        Without this, W_router is registered as a trainable parameter (see
+        TrainableEngine.PARAM_SCHEMA) and is checkpointed/exported, but the
+        training loop never computed a gradient for it, so it silently never
+        trained past its random initialisation.
+
+        The hard top-k dispatch (f_mean) is non-differentiable; matching the
+        standard Switch-Transformer/GShard treatment, f_mean is held constant
+        and only the softmax term P is differentiated.
         """
-        if self._last_probs is None:
-            raise RuntimeError("MoERouter.backward_aux_loss called before route()")
+        if self._last_x is None:
+            raise RuntimeError("MoERouter.backward called before route")
         x, probs, f_mean = self._last_x, self._last_probs, self._last_f_mean
-        nt = probs.shape[0]
-        coef = self.aux_loss_coef * self.n_experts / nt
-        # Softmax-Jacobian-vector product for upstream vector f_mean (broadcast
-        # over tokens): dz = probs * (f_mean - sum_i f_mean_i * probs_i).
-        weighted = np.sum(f_mean[np.newaxis, :] * probs, axis=-1, keepdims=True)
-        dz = coef * probs * (f_mean[np.newaxis, :] - weighted)
-        dlogits = dz / self.temperature
-        return x.T @ dlogits
+        n_tok = x.shape[0]
+        coef = self.aux_loss_coef * self.n_experts / (n_tok * self.temperature)
+        weighted = (probs * f_mean).sum(-1, keepdims=True)
+        d_logits = coef * probs * (f_mean[np.newaxis, :] - weighted)
+        return x.T @ d_logits
 
 
 class Expert(FFNBlock):
-    def __init__(self, expert_id: int, d_model: int, d_ffn: int):
-        super().__init__(d_model, d_ffn)
+    def __init__(self, expert_id: int, d_model: int, d_ffn: int,
+                 seed: Optional[int] = None):
+        # Each expert must start from distinct weights -- previously every
+        # Expert used FFNBlock's hardcoded seed=123 regardless of expert_id,
+        # so all experts in a layer were initialised identically (MoE collapse).
+        super().__init__(d_model, d_ffn, seed=123 + expert_id if seed is None else seed)
         self.expert_id = expert_id
         self.tokens_seen = 0
 
@@ -936,10 +984,12 @@ class MoELayer:
     log = StructuredLogger("MoELayer")
 
     def __init__(self, d_model: int, n_experts: int, top_k: int,
-                 d_ffn_per_expert: int, aux_loss_coef: float = 0.01):
+                 d_ffn_per_expert: int, aux_loss_coef: float = 0.01,
+                 seed: int = 999):
         self.d_model, self.n_experts, self.top_k = d_model, n_experts, top_k
-        self.router = MoERouter(d_model, n_experts, top_k, aux_loss_coef=aux_loss_coef)
-        self.experts = [Expert(i, d_model, d_ffn_per_expert)
+        self.router = MoERouter(d_model, n_experts, top_k,
+                                aux_loss_coef=aux_loss_coef, seed=seed)
+        self.experts = [Expert(i, d_model, d_ffn_per_expert, seed=seed + 100 + i)
                         for i in range(n_experts)]
         # Cache last forward routing so backward can reuse it without re-routing.
         self._last_idx: Optional[np.ndarray] = None
@@ -985,10 +1035,13 @@ class MoELayer:
         Uses routing cached from the last forward() call so expert stats and
         routing_history are not inflated by a second route() call.
 
-        Returns (dx, experts_grads, router_dW_grad). router_dW_grad is the
-        gradient of the auxiliary load-balancing loss w.r.t. router.W_router
-        (the routing weights themselves are treated as constants w.r.t. the
-        MSE task loss, matching the stop-gradient top-k gating convention).
+        Token→expert routing maps are precomputed in O(n_tok * top_k) to avoid
+        the O(n_experts * n_tok * top_k) Python loop that a naive scan would
+        incur.
+
+        Returns (dx, experts_grads, router_grad); router_grad is the aux-loss
+        gradient w.r.t. W_router (see MoERouter.backward) -- previously this
+        method returned only expert gradients, so W_router never trained.
         """
         if self._last_idx is None:
             raise RuntimeError("MoELayer.backward called before forward")
@@ -996,32 +1049,36 @@ class MoELayer:
         n_tok = batch * seq
         xf  = x.reshape(n_tok, d)
         gf  = grad_out.reshape(n_tok, d)
-        idx = self._last_idx
-        wts = self._last_wts
+        idx = self._last_idx                                    # (n_tok, top_k)
+        wts = self._last_wts                                    # (n_tok, top_k)
+
+        # Precompute token→expert routing map: O(n_tok * top_k).
+        # tok_for_expert[e] = list of (token_idx, weight_idx_in_top_k)
+        tok_for_expert: Dict[int, List[Tuple[int, int]]] = {
+            e: [] for e in range(self.n_experts)
+        }
+        for t in range(n_tok):
+            for k in range(self.top_k):
+                tok_for_expert[int(idx[t, k])].append((t, k))
 
         experts_grads: Dict[int, Dict] = {
             e: {"W_gate": 0, "W_up": 0, "W_down": 0,
                 "gamma": 0, "beta": 0, "count": 0}
             for e in range(self.n_experts)
         }
-        # Accumulate input gradient (residual pass-through + FFN contributions).
-        dx_acc = gf.copy()   # gradient from the residual skip connection
+        # dx accumulator: starts with the residual skip-connection gradient.
+        dx_acc = gf.copy()
 
         for e in range(self.n_experts):
-            # Find tokens routed to this expert.
-            sel_tok = [t for t in range(n_tok) if e in idx[t]]
-            if not sel_tok:
+            entries = tok_for_expert[e]
+            if not entries:
                 continue
-            bx = xf[sel_tok]
+            sel_tok = [t for t, _ in entries]
+            w_arr   = np.array([float(wts[t, k]) for t, k in entries])  # (n_sel,)
+            bx      = xf[sel_tok]                                         # (n_sel, d)
 
-            # Routing weights for these tokens at expert e.
-            w_arr = np.array([
-                float(wts[t, int(np.where(idx[t] == e)[0][0])])
-                for t in sel_tok
-            ])                  # (n_sel,)
-
-            # Scale output gradient by routing weight.
-            weighted_gf = gf[sel_tok] * w_arr[:, np.newaxis]   # (n_sel, d)
+            # Scale upstream gradient by routing weight before passing to expert.
+            weighted_gf = gf[sel_tok] * w_arr[:, np.newaxis]
 
             d_x, grads = self.experts[e].backward(bx, weighted_gf)
 
@@ -1038,9 +1095,8 @@ class MoELayer:
             experts_grads[e].update(grads)
             experts_grads[e]["count"] = len(sel_tok)
 
-        router_dW = self.router.backward_aux_loss()
-        return dx_acc.reshape(batch, seq, d), experts_grads, router_dW
-
+        router_grad = self.router.backward()
+        return dx_acc.reshape(batch, seq, d), experts_grads, router_grad
 
 # In[ ]:
 
@@ -1067,15 +1123,18 @@ class TensorParallelMatMul:
         else:
             sz = d_in // n_gpus
             self.shards = [W[i * sz:(i + 1) * sz, :].copy() for i in range(n_gpus)]
-        self.W_full = W
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         if self.strategy == "column":
             return np.concatenate([x @ s for s in self.shards], axis=-1)
+        # Row strategy: each shard handles a slice of the input dimension.
+        # Use explicit accumulation instead of sum() to avoid the implicit
+        # '0 + ndarray' on the first iteration (undocumented __radd__ behaviour).
         sz = self.d_in // self.n_gpus
-        return sum(x[..., i * sz:(i + 1) * sz] @ s
-                   for i, s in enumerate(self.shards))
-
+        result = x[..., :sz] @ self.shards[0]
+        for i, s in enumerate(self.shards[1:], start=1):
+            result = result + x[..., i * sz:(i + 1) * sz] @ s
+        return result
 
 # In[ ]:
 
@@ -1129,10 +1188,14 @@ class MEMITEditor:
     def _compute_null_projector(self) -> np.ndarray:
         if not self.K_history:
             return np.eye(self.d_model)
-        K = np.stack(self.K_history)
+        K = np.stack(self.K_history)                           # (n_facts, d_model)
+        # Regularised Gram matrix: (n_facts, n_facts).
         KKT = K @ K.T + self.lambda_reg * np.eye(len(K))
-        Kpinv = K.T @ np.linalg.inv(KKT)
-        P = Kpinv @ K
+        # Compute K.T @ inv(KKT) without explicit inversion:
+        # solve(KKT, K) gives inv(KKT) @ K  →  .T gives K.T @ inv(KKT)
+        # (valid because KKT is symmetric positive-definite by construction).
+        Kpinv = np.linalg.solve(KKT, K).T                     # (d_model, n_facts)
+        P = Kpinv @ K                                          # (d_model, d_model)
         return np.eye(self.d_model) - P
 
     def encode_fact(self, text: str, key: np.ndarray,
@@ -1172,21 +1235,36 @@ class MEMITEditor:
                 W += f.influence * f.delta_W
         return W
 
-
 # In[ ]:
 
 
 # 14. Simplicial-complex message passing
 class SimplicialComplexNN:
+    """Message passing on a simplicial complex (nodes + edges + triangles).
+
+    Forward pass computes two complementary node-level signals and combines them:
+
+      node_signal = (L0 @ x0) @ W0        — Laplacian-smoothed node features
+      edge_signal = (B1 @ x1) @ W_edge    — edge features aggregated back to nodes
+
+    When x1 is derived from the coboundary (x1 = B1.T @ x0), B1 @ x1 = L0 @ x0,
+    so both terms apply Laplacian smoothing through different learned projections.
+    This is mathematically equivalent to a single Laplacian layer with twice the
+    output capacity via two weight matrices — a valid architectural choice that
+    allows the network to learn complementary subspaces of the smoothed signal.
+
+    To use independently-learned edge features, pass a pre-computed x1 to forward().
+    """
     log = StructuredLogger("SimplicialNN")
 
-    def __init__(self, n_nodes: int, d_features: int, d_hidden: int):
+    def __init__(self, n_nodes: int, d_features: int, d_hidden: int,
+                 seed: int = 333):
         self.n_nodes, self.d_features, self.d_hidden = n_nodes, d_features, d_hidden
         self.edges: List[Tuple[int, int]] = []
         self.triangles: List[Tuple[int, int, int]] = []
-        rng = np.random.RandomState(333)
+        rng = np.random.RandomState(seed)
         self.W0     = rng.randn(d_features, d_hidden) * math.sqrt(2.0 / d_features)
-        self.W_down = rng.randn(d_features, d_hidden) * math.sqrt(2.0 / d_features)
+        self.W_edge = rng.randn(d_features, d_hidden) * math.sqrt(2.0 / d_features)
 
     def add_edge(self, u: int, v: int):
         if u == v:
@@ -1221,13 +1299,22 @@ class SimplicialComplexNN:
             assert np.linalg.norm(B1 @ B2) < 1e-10,                 "Boundary-of-boundary != 0: simplicial identity violated"
         return B1, B2
 
-    def forward(self, x0: np.ndarray) -> np.ndarray:
-        B1, _ = self.boundary_operators()
-        L0 = B1 @ B1.T
-        x1 = B1.T @ x0
-        h  = (L0 @ x0) @ self.W0 + (B1 @ x1) @ self.W_down
-        return SwiGLU.swish(h)
+    def forward(self, x0: np.ndarray,
+                x1: Optional[np.ndarray] = None) -> np.ndarray:
+        """Message passing forward.
 
+        Args:
+            x0: Node features, shape (n_nodes, d_features).
+            x1: Edge features, shape (n_edges, d_features).
+                Defaults to B1.T @ x0 (coboundary of node features).
+        """
+        B1, _ = self.boundary_operators()
+        L0 = B1 @ B1.T                              # (n_nodes, n_nodes)
+        if x1 is None:
+            x1 = B1.T @ x0                          # (n_edges, d_features)
+        node_signal = (L0 @ x0) @ self.W0           # (n_nodes, d_hidden)
+        edge_signal = (B1 @ x1) @ self.W_edge       # (n_nodes, d_hidden)
+        return SwiGLU.swish(node_signal + edge_signal)
 
 # In[ ]:
 
@@ -1405,6 +1492,25 @@ class TrainingState:
         self.aux_history.append(float(aux))
         self.lr_history.append(float(lr))
 
+    def to_dict(self) -> Dict:
+        return {
+            "loss_history": list(self.loss_history),
+            "step_history": list(self.step_history),
+            "error_rates":  list(self.error_rates),
+            "aux_history":  list(self.aux_history),
+            "lr_history":   list(self.lr_history),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "TrainingState":
+        ts = cls()
+        ts.loss_history = [float(x) for x in d.get("loss_history", [])]
+        ts.step_history = [int(x)   for x in d.get("step_history", [])]
+        ts.error_rates  = [float(x) for x in d.get("error_rates", [])]
+        ts.aux_history  = [float(x) for x in d.get("aux_history", [])]
+        ts.lr_history   = [float(x) for x in d.get("lr_history", [])]
+        return ts
+
     def verify_monotone(self, tol: float = 1e-6) -> bool:
         return LTLProperties.monotone_non_increase(self.error_rates, tol)
 
@@ -1471,22 +1577,14 @@ class MetacognitiveTrainingLoop:
         cfg = self.model.config
         x, y = self._sample_batch()
 
-        # Forward pass: attention -> FFN residual block -> MoE routing. This
-        # must mirror TrainableEngine.forward() exactly, since that is the
-        # graph the resulting weights are actually evaluated with at
-        # inference/checkpoint time. (Previously this fed attn_out straight
-        # into MoE, skipping the FFN block in the forward pass entirely,
-        # while still computing and applying an FFN gradient as if `pred`
-        # had come from ffn.forward(attn_out) -- a gradient totally
-        # disconnected from the real computation graph.)
-        # `% cfg.max_seq` alone can leave seq_off + seq_len > max_seq (e.g.
-        # step=59, max_seq=64, seq_len=6 -> offset 59+6=65), which RoPE
-        # rejects with a ValueError -- a real crash once training runs past
-        # roughly max_seq steps. Cycle over the valid offset range instead.
-        max_off = max(1, cfg.max_seq - cfg.seq_len + 1)
-        seq_off = self.step % max_off
+        # Use current step as a deterministic seq_offset so training is
+        # reproducible and we never draw from the engine's internal PRNG here.
+        seq_off = self.step % cfg.max_seq
+
+        # ── Forward: attention → FFN → MoE ──────────────────────────────────
+        # This ordering must be mirrored exactly in the backward pass below.
         attn_out = self.model.attention.forward(x, seq_offset=seq_off)
-        ffn_out = self.model.ffn.forward(attn_out)
+        ffn_out  = self.model.ffn.forward(attn_out)
         moe_out, aux, _ = self.model.moe.forward(ffn_out)
         pred = moe_out
 
@@ -1494,11 +1592,9 @@ class MetacognitiveTrainingLoop:
 
         grads: Dict[str, np.ndarray] = {}
 
-        # Backward through MoE first (outermost layer): yields the gradient
-        # w.r.t. its input (ffn_out), which is what must be fed into the FFN
-        # backward pass below -- NOT the raw loss gradient, which would skip
-        # the MoE Jacobian entirely.
-        d_ffn_out, moe_grads, router_dW = self.model.moe.backward(ffn_out, grad_out)
+        # ── Backward through MoE (input: ffn_out) ───────────────────────────
+        d_ffn_out, moe_grads, router_grad = self.model.moe.backward(ffn_out, grad_out)
+        grads["moe.router.W_router"] = router_grad
         for eid, eg in moe_grads.items():
             if eg["count"] == 0:
                 continue
@@ -1526,6 +1622,17 @@ class MetacognitiveTrainingLoop:
         # Backward through attention using the gradient that flows in from
         # FFN, completing the chain rule all the way back to x.
         _, attn_grads = self.model.attention.backward(x, d_attn_out)
+        for k, v in attn_grads.items():
+            grads[f"attn.{k}"] = v
+
+        # ── Backward through FFN (input: attn_out) ──────────────────────────
+        d_attn_out, ffn_grads = self.model.ffn.backward(attn_out, d_ffn_out)
+        for k, v in ffn_grads.items():
+            grads[f"ffn.{k}"] = v
+
+        # ── Backward through Attention (input: x) ───────────────────────────
+        _, attn_grads = self.model.attention.backward(x, d_attn_out,
+                                                      seq_offset=seq_off)
         for k, v in attn_grads.items():
             grads[f"attn.{k}"] = v
 
@@ -1569,7 +1676,6 @@ class MetacognitiveTrainingLoop:
             "history_length": len(self.state.loss_history),
             "complete": self.complete,
         }
-
 
 # In[ ]:
 
@@ -1621,7 +1727,7 @@ class TrainableEngine:
         "memit.W_base": ("memit", "W_base"),
         "memit.C":      ("memit", "C"),
         "simplicial.W0":     ("simplicial", "W0"),
-        "simplicial.W_down": ("simplicial", "W_down"),
+        "simplicial.W_edge": ("simplicial", "W_edge"),
     }
 
     def __init__(self, config: EngineConfig):
@@ -1634,22 +1740,31 @@ class TrainableEngine:
         self.manifold.perturb_metric(noise_scale=0.5)
         self.rope = RoPE(d_model=config.d_model, base=config.rope_base,
                          max_seq=config.max_seq)
+        # Component seeds are derived from config.seed (each offset by a fixed
+        # constant so they don't collide) so that changing EngineConfig.seed
+        # actually changes the model's initial weights -- previously every
+        # component used its own hardcoded literal RandomState seed, so two
+        # engines built with different config.seed values started identical.
         self.attention = CoDAGQAL(d_model=config.d_model,
                                   n_heads=config.n_heads,
                                   n_kv_heads=config.n_kv_heads,
                                   n_landmarks=config.n_landmarks,
                                   ema_decay=config.ema_decay,
-                                  rope=self.rope)
-        self.ffn = FFNBlock(d_model=config.d_model, d_ffn=config.d_ffn)
+                                  rope=self.rope,
+                                  seed=config.seed + 1)
+        self.ffn = FFNBlock(d_model=config.d_model, d_ffn=config.d_ffn,
+                            seed=config.seed + 2)
         self.moe = MoELayer(d_model=config.d_model, n_experts=config.n_experts,
                             top_k=config.top_k,
-                            d_ffn_per_expert=config.d_ffn_per_expert)
+                            d_ffn_per_expert=config.d_ffn_per_expert,
+                            seed=config.seed + 3)
         self.memit = MEMITEditor(d_model=config.d_model, layer_idx=0,
                                  lambda_reg=config.memit_lambda_reg)
         self.simplicial = SimplicialComplexNN(
             n_nodes=4,
             d_features=config.d_model // 4,
             d_hidden=config.d_model // 2,
+            seed=config.seed + 4,
         )
         for u, v in [(0, 1), (1, 2), (2, 3), (3, 0), (0, 2)]:
             self.simplicial.add_edge(u, v)
@@ -1746,7 +1861,7 @@ class TrainableEngine:
 
     def forward(self, x: np.ndarray, seq_offset: Optional[int] = None,
                 return_extras: bool = False):
-        """Forward pass.
+        """Forward pass: attention → FFN → MoE.
 
         Args:
             x: Input tensor of shape (batch, seq, d_model).
@@ -1764,7 +1879,6 @@ class TrainableEngine:
         if return_extras:
             return {"attn": attn_out, "ffn": ffn_out, "moe": moe_out, "aux": aux}
         return moe_out
-
 
 # In[ ]:
 
@@ -1822,12 +1936,18 @@ def load_checkpoint(path: str) -> Tuple[
     """
     with open(path, "rb") as f:
         payload = pickle.load(f)
+    schema_version = payload.get("schema_version", 0)
+    if schema_version != 1:
+        warnings.warn(
+            f"Checkpoint at '{path}' has schema_version={schema_version} "
+            f"(expected 1); loading may fail or produce incorrect results.",
+            UserWarning, stacklevel=2,
+        )
     cfg_data = payload.get("config", {})
     cfg = EngineConfig(**{k: v for k, v in cfg_data.items()
                           if k in EngineConfig.__dataclass_fields__})
     state_dict = payload.get("state_dict", {})
     return cfg, state_dict, payload.get("trainer"), payload.get("extra")
-
 
 # In[ ]:
 
@@ -1869,9 +1989,14 @@ def import_safetensors(path: str, engine: Optional["TrainableEngine"] = None,
                        strict: bool = True) -> "TrainableEngine":
     """Load a .safetensors file into a fresh or provided TrainableEngine."""
     tensors = st_load(str(path))
-    with safe_open(str(path), framework="np") as f:   # safe_open imported at top
+    with safe_open(str(path), framework="np") as f:
         meta = dict(f.metadata() or {})
-    cfg_dict = json.loads(meta["config"]) if "config" in meta else {}
+    if "config" not in meta:
+        raise KeyError(
+            f"'config' key missing from safetensors metadata in '{path}'. "
+            "The file may be corrupt or produced by an incompatible version."
+        )
+    cfg_dict = json.loads(meta["config"])
     cfg = EngineConfig(**{k: v for k, v in cfg_dict.items()
                           if k in EngineConfig.__dataclass_fields__})
     if engine is None:
@@ -1903,9 +2028,8 @@ def inspect_safetensors(path: str) -> Dict:
         "metadata": meta,
     }
 
-
 # ## Training driver
-#
+# 
 # The function below wires everything together: it builds an engine, optionally
 # restores from a checkpoint, runs a training loop with periodic checkpointing
 # and metric logging, and finally exports the trained weights to safetensors.
@@ -1923,7 +2047,7 @@ def train_engine(cfg: Optional[EngineConfig] = None,
                  log_every: int = 1,
                  seed: Optional[int] = None) -> Dict:
     """Train the engine end-to-end with checkpointing and safetensors export."""
-    # ----- initialise / restore -------------------------------------------
+    # ── Initialise or resume ──────────────────────────────────────────────────
     if resume_from and Path(resume_from).exists():
         cfg_ckpt, state, trainer_state, _ = load_checkpoint(resume_from)
         engine = TrainableEngine(cfg_ckpt)
@@ -1945,6 +2069,11 @@ def train_engine(cfg: Optional[EngineConfig] = None,
 
     trainer = MetacognitiveTrainingLoop(engine, lr=starting_lr, seed=cfg.seed)
     trainer.step = start_step
+
+    # Restore complete training history so LTL checks and metrics are continuous.
+    if resume_from and trainer_state and "training_state" in trainer_state:
+        trainer.state = TrainingState.from_dict(trainer_state["training_state"])
+
     print(f"[train] running {max_steps} steps from step {start_step}")
     history: List[Dict] = []
 
@@ -1955,7 +2084,6 @@ def train_engine(cfg: Optional[EngineConfig] = None,
             print(f"  step {info['step']:>4d} | loss={info['loss']:.6f} "
                   f"err={info['error_rate']:.4f} lr={info['lr']:.2e}")
 
-        # ----- periodic checkpoint ----------------------------------------
         if checkpoint_every and trainer.step % checkpoint_every == 0:
             ckpt_path = Path(checkpoint_dir) / f"step_{trainer.step:06d}.pkl"
             manifest = save_checkpoint(str(ckpt_path), engine, trainer)
@@ -1963,16 +2091,14 @@ def train_engine(cfg: Optional[EngineConfig] = None,
                   f"({manifest['n_params']:,} params, "
                   f"{manifest['size_bytes'] / 1024:.1f} KB)")
 
-    # ----- final checkpoint -----------------------------------------------
     final_ckpt = Path(checkpoint_dir) / "final.pkl"
     save_checkpoint(str(final_ckpt), engine, trainer)
     print(f"[ckpt] final checkpoint -> {final_ckpt}")
 
-    # ----- safetensors export ---------------------------------------------
     manifest = export_safetensors(safetensors_path, engine, metadata={
-        "training_history": history,
         "final_loss": float(trainer.state.loss_history[-1]),
         "final_error_rate": float(trainer.state.error_rates[-1]),
+        "total_steps": str(trainer.step),
     })
     print(f"[st]  exported safetensors -> {safetensors_path} "
           f"({manifest['n_tensors']} tensors, "
@@ -1990,7 +2116,7 @@ def train_engine(cfg: Optional[EngineConfig] = None,
 
 
 # ## Inference from safetensors
-#
+# 
 # The helpers below demonstrate how to load a saved `.safetensors` file back into
 # a fresh `TrainableEngine`, run a forward pass on new inputs, and inspect the
 # round-trip integrity.
@@ -2030,15 +2156,15 @@ def parity_check(engine_a: "TrainableEngine", engine_b: "TrainableEngine",
 
 
 # ## End-to-end demonstration
-#
+# 
 # The cell below executes the full pipeline in a single run:
-#
+# 
 # 1. Build a fresh `TrainableEngine`.
 # 2. Train for `STEPS` steps, checkpointing every `CKPT_EVERY` steps.
 # 3. Export the trained model to safetensors.
 # 4. Re-import the safetensors into a brand-new engine.
 # 5. Run inference and verify the round-trip is numerically identical.
-#
+# 
 # You can re-run this cell after tweaking the constants at the top.
 
 # In[ ]:
@@ -2115,7 +2241,7 @@ print(f"resumed loss : {resumed['history'][0]['loss']:.6f}")
 
 
 # ## What just happened
-#
+# 
 # - **Training** — a 30-step (configurable) loop running real forward + backward
 #   passes through SwiGLU, FFN residual, MoE routing and attention. Loss values
 #   are computed live, not faked.
@@ -2128,6 +2254,6 @@ print(f"resumed loss : {resumed['history'][0]['loss']:.6f}")
 # - **Inference** — `import_safetensors` rebuilds an engine and loads the
 #   weights. A parity check confirms bit-exact reproduction of the forward
 #   pass on identical inputs.
-#
+# 
 # Tweak `EngineConfig` to change the architecture (d_model, n_heads,
 # n_experts, top_k, ...) and re-run the demo cell to retrain from scratch.

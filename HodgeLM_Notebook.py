@@ -499,13 +499,14 @@ class CoDAGQAL:
 
     Attention: A = softmax(Q K1^T) - lambda * softmax(Q K2^T).
 
-    The landmark cache collects a running set of orthogonalised key vectors that
-    can be used by future forward passes to augment the attention span beyond the
-    current context window. The cache is populated each call *and* injected back
-    into the attention computation on subsequent calls once it holds at least one
-    entry (see _attend_with_landmarks): stored landmark keys/values are prepended
-    to the current-step K/V before the softmax and are never causally masked, so
-    they remain visible to every query position in later steps.
+    The landmark cache collects a running set of orthogonalised key vectors
+    from past forward() calls and injects them back into every subsequent
+    forward pass by concatenating them onto the current K/V before the score
+    computation (see _attend_with_landmarks), extending the effective
+    attention span beyond the current context window. Landmarks are treated
+    as detached cache state during backward(): gradients do not flow into the
+    historical tokens that produced them, only into the current-step K/V/Q/O
+    projections.
     """
     log = StructuredLogger("CoDA-GQA-L")
 
@@ -675,6 +676,13 @@ class CoDAGQAL:
         a2 = self._softmax(s2)
         diff = a1 - self.lambda_param * a2
         O = (diff @ V_full).transpose(0, 2, 1, 3)  # (batch, seq, heads, d_head)
+
+        # Cache everything backward() needs. Captured before the landmark-cache
+        # mutation below so it reflects the lmc actually used in this forward.
+        self._cache = {
+            "Q_t": Q_t, "K1_full": K1_full, "K2_full": K2_full, "V_full": V_full,
+            "a1": a1, "a2": a2, "lmc": lmc, "seq_offset": seq_offset,
+        }
 
         # --- Landmark cache update ---
         Kflat = K1_kv.reshape(batch * seq, -1)
@@ -1003,29 +1011,59 @@ class MoERouter:
             self.expert_stats[i].routing_prob  = float(P[i])
         self.routing_history.append({"f": f_mean.copy(), "P": P.copy(),
                                      "aux_loss": aux})
-        self._last_x, self._last_probs, self._last_f_mean = x, probs, f_mean
+
+        # aux = aux_loss_coef * n_experts * dot(f_mean, P). f_mean is a hard
+        # (step-function) load indicator; per standard MoE load-balancing
+        # practice (Switch Transformer / GShard) it is treated as a detached
+        # constant, so d(aux)/d(probs) flows only through P = probs.mean(0):
+        # d(aux)/d(P_j) = aux_loss_coef * n_experts * f_mean[j], and
+        # d(P_j)/d(probs[t, j]) = 1/nt for every token t.
+        d_probs_aux = np.broadcast_to(
+            (self.aux_loss_coef * self.n_experts * f_mean) / nt, (nt, self.n_experts)
+        ).copy()
+        self._cache = {"probs": probs, "idx": idx, "d_probs_aux": d_probs_aux}
         return idx, wts, aux
 
-    def backward(self) -> np.ndarray:
-        """Gradient of the auxiliary load-balance loss w.r.t. W_router.
+    def backward(self, x: np.ndarray, d_wts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Backward through route(). Returns (dx, dW_router).
 
-        Without this, W_router is registered as a trainable parameter (see
-        TrainableEngine.PARAM_SCHEMA) and is checkpointed/exported, but the
-        training loop never computed a gradient for it, so it silently never
-        trained past its random initialisation.
+        `d_wts` is dLoss/d(wts) from the weighted expert-combination in
+        MoELayer, i.e. the gradient of the main task loss with respect to the
+        per-token top-k routing weights returned by the last route() call.
+        The auxiliary load-balance loss's gradient (via d_probs_aux, cached in
+        route()) is unconditionally added, since MetacognitiveTrainingLoop
+        always includes `+ aux` in the total loss with coefficient 1.
 
-        The hard top-k dispatch (f_mean) is non-differentiable; matching the
-        standard Switch-Transformer/GShard treatment, f_mean is held constant
-        and only the softmax term P is differentiated.
+        `dx` is the gradient flowing back through `logits = x @ W_router`
+        alone; the caller must add the separate gradient contribution from
+        the expert combination (bo depends on x too) to get the full dx.
+
+        The hard top-k selection itself (`idx`) is treated as fixed/
+        non-differentiable, consistent with standard discrete MoE routing:
+        only the continuous softmax probabilities at the selected indices
+        carry gradient.
         """
-        if self._last_x is None:
+        if self._cache is None:
             raise RuntimeError("MoERouter.backward called before route")
-        x, probs, f_mean = self._last_x, self._last_probs, self._last_f_mean
-        n_tok = x.shape[0]
-        coef = self.aux_loss_coef * self.n_experts / (n_tok * self.temperature)
-        weighted = (probs * f_mean).sum(-1, keepdims=True)
-        d_logits = coef * probs * (f_mean[np.newaxis, :] - weighted)
-        return x.T @ d_logits
+        probs, idx, d_probs_aux = (self._cache["probs"], self._cache["idx"],
+                                   self._cache["d_probs_aux"])
+
+        top_p = np.take_along_axis(probs, idx, axis=-1)
+        denom = top_p.sum(-1, keepdims=True)
+        # wts = top_p / denom
+        d_top_p = (d_wts / denom
+                  - np.sum(d_wts * top_p, axis=-1, keepdims=True) / denom ** 2)
+
+        d_probs = d_probs_aux.copy()
+        existing = np.take_along_axis(d_probs, idx, axis=-1)
+        np.put_along_axis(d_probs, idx, existing + d_top_p, axis=-1)
+
+        # Softmax backward: d_z = probs * (d_probs - sum(probs * d_probs, -1)).
+        d_z = probs * (d_probs - np.sum(probs * d_probs, axis=-1, keepdims=True))
+        d_logits = d_z / self.temperature
+        dW_router = x.T @ d_logits
+        dx = d_logits @ self.W_router.T
+        return dx, dW_router
 
 
 class Expert(FFNBlock):
@@ -1150,8 +1188,10 @@ class MoELayer:
         idx = self._last_idx                                    # (n_tok, top_k)
         wts = self._last_wts                                    # (n_tok, top_k)
 
-        # Precompute token→expert routing map: O(n_tok * top_k).
-        # tok_for_expert[e] = list of (token_idx, weight_idx_in_top_k)
+        # Precompute the token->expert routing map in O(n_tok * top_k), so the
+        # per-expert loop below doesn't re-scan all n_tok tokens for every
+        # expert (which would cost O(n_experts * n_tok * top_k)).
+        # tok_for_expert[e] = list of (token_idx, position within top_k).
         tok_for_expert: Dict[int, List[Tuple[int, int]]] = {
             e: [] for e in range(self.n_experts)
         }
@@ -1164,37 +1204,49 @@ class MoELayer:
                 "gamma": 0, "beta": 0, "count": 0}
             for e in range(self.n_experts)
         }
-        # dx accumulator: starts with the residual skip-connection gradient.
-        dx_acc = gf.copy()
+        # Accumulate input gradient (residual pass-through + FFN contributions).
+        dx_acc = gf.copy()   # gradient from the residual skip connection
+        d_wts = np.zeros_like(wts)   # dLoss/d(routing weight), for the router
 
         for e in range(self.n_experts):
             entries = tok_for_expert[e]
             if not entries:
                 continue
             sel_tok = [t for t, _ in entries]
-            w_arr   = np.array([float(wts[t, k]) for t, k in entries])  # (n_sel,)
-            bx      = xf[sel_tok]                                         # (n_sel, d)
+            k_pos = np.array([k for _, k in entries])
+            bx = xf[sel_tok]
+            w_arr = wts[sel_tok, k_pos]   # (n_sel,)
 
-            # Scale upstream gradient by routing weight before passing to expert.
-            weighted_gf = gf[sel_tok] * w_arr[:, np.newaxis]
+            # Scale output gradient by routing weight.
+            weighted_gf = gf[sel_tok] * w_arr[:, np.newaxis]   # (n_sel, d)
 
             d_x, grads = self.experts[e].backward(bx, weighted_gf)
 
-            # Accumulate expert input-gradient into the total. `d_x` is
-            # already d(loss)/d(bx) given the pre-scaled upstream gradient
-            # `weighted_gf` (= w_k * gf): FFNBlock.backward chains through
-            # both the expert's own internal residual and its FFN branch
-            # using that upstream gradient, so it already carries exactly
-            # one factor of w_k. Multiplying by w_arr[i] again here would
-            # double-count the routing weight and understate dx_acc.
+            # Routing-weight gradient: dLoss/dw = <upstream_grad, expert_output>,
+            # since out[t] = sum_k w_{t,k} * expert_k(x[t]).
+            bo = self.experts[e].forward(bx)
+            d_wts[sel_tok, k_pos] = np.sum(gf[sel_tok] * bo, axis=-1)
+
+            # Accumulate expert input-gradient into the total. d_x already
+            # carries the routing-weight factor: backward() is linear in its
+            # grad_out argument and weighted_gf = w * gf, so d_x = w * d(bo)/d(bx)
+            # already. Multiplying by w_arr again here would double-count it
+            # (an extra spurious factor of w), corrupting the FFN experts'
+            # upstream gradient.
             for i, t in enumerate(sel_tok):
                 dx_acc[t] += d_x[i]
 
             experts_grads[e].update(grads)
             experts_grads[e]["count"] = len(sel_tok)
 
-        router_grad = self.router.backward()
-        return dx_acc.reshape(batch, seq, d), experts_grads, router_grad
+        # Router backward: adds the gradient path through logits = x @ W_router
+        # (routing weights depend on x too, not just the experts' own inputs).
+        dx_router, dW_router = self.router.backward(xf, d_wts)
+        dx_acc += dx_router
+        experts_grads["router"] = {"W_router": dW_router}
+
+        return dx_acc.reshape(batch, seq, d), experts_grads
+
 
 # In[ ]:
 
@@ -1689,14 +1741,16 @@ class MetacognitiveTrainingLoop:
         cfg = self.model.config
         x, y = self._sample_batch()
 
-        # Use current step as a deterministic seq_offset so training is
-        # reproducible and we never draw from the engine's internal PRNG here.
+        # Forward pass: use step as deterministic seq_offset for training.
+        # Mirrors TrainableEngine.forward()'s attention -> ffn -> moe order
+        # exactly, so the weights being optimised here are the same weights
+        # (and same computational graph) used at inference time.
         seq_off = self.step % cfg.max_seq
 
         # ── Forward: attention → FFN → MoE ──────────────────────────────────
         # This ordering must be mirrored exactly in the backward pass below.
         attn_out = self.model.attention.forward(x, seq_offset=seq_off)
-        ffn_out  = self.model.ffn.forward(attn_out)
+        ffn_out = self.model.ffn.forward(attn_out)
         moe_out, aux, _ = self.model.moe.forward(ffn_out)
         pred = moe_out
 
@@ -1704,11 +1758,11 @@ class MetacognitiveTrainingLoop:
 
         grads: Dict[str, np.ndarray] = {}
 
-        # ── Backward through MoE (input: ffn_out) ───────────────────────────
-        d_ffn_out, moe_grads, router_grad = self.model.moe.backward(ffn_out, grad_out)
-        grads["moe.router.W_router"] = router_grad
+        # Backward through MoE (last op in the forward chain).
+        d_moe_in, moe_grads = self.model.moe.backward(ffn_out, grad_out)
+        grads["moe.router.W_router"] = moe_grads["router"]["W_router"]
         for eid, eg in moe_grads.items():
-            if eg["count"] == 0:
+            if eid == "router" or eg["count"] == 0:
                 continue
             for k in ("W_gate", "W_up", "W_down", "gamma", "beta"):
                 if isinstance(eg[k], np.ndarray):
@@ -2189,11 +2243,13 @@ def train_engine(cfg: Optional[EngineConfig] = None,
 
     trainer = MetacognitiveTrainingLoop(engine, lr=starting_lr, seed=cfg.seed)
     trainer.step = start_step
-
-    # Restore complete training history so LTL checks and metrics are continuous.
-    if resume_from and trainer_state and "training_state" in trainer_state:
-        trainer.state = TrainingState.from_dict(trainer_state["training_state"])
-
+    if resume_from and trainer_state:
+        # Restore the full loss/error/aux/lr history too, not just step/lr,
+        # so LTL checks and metrics stay continuous across the resume point
+        # (the checkpoint already stores this; previously it was saved but
+        # never read back).
+        trainer.state = TrainingState.from_dict(trainer_state)
+        trainer.complete = trainer_state.get("complete", False)
     print(f"[train] running {max_steps} steps from step {start_step}")
     history: List[Dict] = []
 

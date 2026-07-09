@@ -537,6 +537,9 @@ class CoDAGQAL:
         self.ema_V = np.zeros(d_kv)
         self.ema_initialized = False
         self.total_tokens_processed = 0
+        # Populated by forward(); consumed by backward(). See the note on
+        # backward() for why this must be a cache rather than a recompute.
+        self._cache: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def _softmax(z: np.ndarray) -> np.ndarray:
@@ -647,8 +650,16 @@ class CoDAGQAL:
         # --- Landmark cache update ---
         Kflat = K1_kv.reshape(batch * seq, -1)
         Vflat = V_kv_orig.reshape(batch * seq, -1)
-        # Per-token importance = sum of attention mass over keys, mean over heads.
-        attn_mass = a1.sum(axis=-1).mean(axis=1).reshape(-1)  # (batch*seq,)
+        # Per-token importance = incoming attention mass summed over queries
+        # (how much attention this token receives as a key), mean over heads.
+        # NOTE: a1.sum(axis=-1) is a bug trap -- softmax always sums to 1.0
+        # along the key axis it was normalised over, so summing there yields a
+        # constant and destroys the signal. We must sum over the *query* axis
+        # (-2) instead, and restrict to the non-landmark key columns so the
+        # count lines up with Kflat/Vflat (which hold only the current-step
+        # keys, not the previously-cached landmarks).
+        lmc_prev = int(np.asarray(self.landmark_count).item())
+        attn_mass = a1[..., lmc_prev:].sum(axis=-2).mean(axis=1).reshape(-1)  # (batch*seq,)
         lmK, lmV = self._select_landmarks(Kflat, Vflat, attn_mass)
         free = self.n_landmarks - int(np.asarray(self.landmark_count).item())
         if free > 0:
@@ -660,6 +671,20 @@ class CoDAGQAL:
         self._update_ema(Kflat, Vflat)
 
         Of = O.reshape(batch * seq, self.n_heads * self.d_head)
+
+        # Cache activations for backward(). We deliberately cache rather than
+        # let backward() recompute the forward pass: the landmark cache and
+        # EMA above are mutated by *every* forward() call, so a naive
+        # recompute inside backward() would run against post-update landmark
+        # state and silently produce a gradient for a different (later)
+        # attention pattern than the one that actually produced this output.
+        self._cache = {
+            "batch": batch, "seq": seq, "d": d,
+            "xf": xf, "Q_t": Q_t,
+            "K1_full": K1_full, "K2_full": K2_full, "V_full": V_full,
+            "a1": a1, "a2": a2, "Of": Of,
+            "lmc": lmc_prev, "seq_offset": seq_offset,
+        }
         return (Of @ self.W_O).reshape(batch, seq, d)
 
     def backward(self, x: np.ndarray, grad_out: np.ndarray,
@@ -1057,8 +1082,15 @@ class MoELayer:
 
             d_x, grads = self.experts[e].backward(bx, weighted_gf)
 
+            # Accumulate expert input-gradient into the total. `d_x` is
+            # already d(loss)/d(bx) given the pre-scaled upstream gradient
+            # `weighted_gf` (= w_k * gf): FFNBlock.backward chains through
+            # both the expert's own internal residual and its FFN branch
+            # using that upstream gradient, so it already carries exactly
+            # one factor of w_k. Multiplying by w_arr[i] again here would
+            # double-count the routing weight and understate dx_acc.
             for i, t in enumerate(sel_tok):
-                dx_acc[t] += w_arr[i] * d_x[i]
+                dx_acc[t] += d_x[i]
 
             experts_grads[e].update(grads)
             experts_grads[e]["count"] = len(sel_tok)
@@ -1568,7 +1600,30 @@ class MetacognitiveTrainingLoop:
                 continue
             for k in ("W_gate", "W_up", "W_down", "gamma", "beta"):
                 if isinstance(eg[k], np.ndarray):
-                    grads[f"moe.expert{eid}.{k}"] = eg[k] / max(eg["count"], 1)
+                    # NOTE: do not divide by eg["count"] here. moe.backward()
+                    # already returns the exact gradient of the (batch-mean)
+                    # loss w.r.t. each expert's weights; dividing by the
+                    # number of tokens routed to the expert has no basis in
+                    # the chain rule and was verified (via finite-difference
+                    # gradient checking) to corrupt the gradient magnitude,
+                    # shrinking busier experts' updates more than idle ones.
+                    grads[f"moe.expert{eid}.{k}"] = eg[k]
+        # Router weights only ever receive the load-balancing aux-loss
+        # gradient (the routing decision itself is treated as a constant
+        # w.r.t. the task loss, per the standard top-k gating convention).
+        grads["moe.router.W_router"] = router_dW
+
+        # Backward through FFN using the gradient that actually flows in
+        # from MoE.
+        d_attn_out, ffn_grads = self.model.ffn.backward(attn_out, d_ffn_out)
+        for k, v in ffn_grads.items():
+            grads[f"ffn.{k}"] = v
+
+        # Backward through attention using the gradient that flows in from
+        # FFN, completing the chain rule all the way back to x.
+        _, attn_grads = self.model.attention.backward(x, d_attn_out)
+        for k, v in attn_grads.items():
+            grads[f"attn.{k}"] = v
 
         # ── Backward through FFN (input: attn_out) ──────────────────────────
         d_attn_out, ffn_grads = self.model.ffn.backward(attn_out, d_ffn_out)

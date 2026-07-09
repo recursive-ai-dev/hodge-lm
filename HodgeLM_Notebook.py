@@ -135,7 +135,6 @@ class StructuredLogger:
 
 ROOT_LOG = StructuredLogger("ENGINE")
 
-
 # In[ ]:
 
 
@@ -425,7 +424,6 @@ class SwiGLU:
         dx = dx_flat.reshape(x.shape)
         return dx, dW1, dW2
 
-
 # In[ ]:
 
 
@@ -501,16 +499,19 @@ class CoDAGQAL:
 
     Attention: A = softmax(Q K1^T) - lambda * softmax(Q K2^T).
 
-    The landmark cache collects a running set of orthogonalised key vectors
-    from past forward() calls and injects them back into the attention
-    computation as extra, fixed K/V columns (see _attend_with_landmarks) so
-    the effective attention span extends beyond the current context window.
+    The landmark cache collects a running set of orthogonalised key vectors that
+    can be used by future forward passes to augment the attention span beyond the
+    current context window. The cache is populated each call *and* injected back
+    into the attention computation on subsequent calls once it holds at least one
+    entry (see _attend_with_landmarks): stored landmark keys/values are prepended
+    to the current-step K/V before the softmax and are never causally masked, so
+    they remain visible to every query position in later steps.
     """
     log = StructuredLogger("CoDA-GQA-L")
 
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int,
                  n_landmarks: int = 16, ema_decay: float = 0.99,
-                 rope: Optional[RoPE] = None):
+                 rope: Optional[RoPE] = None, seed: int = 42):
         if n_heads % n_kv_heads != 0:
             raise ValueError("n_heads must be divisible by n_kv_heads")
         self.d_model, self.n_heads, self.n_kv_heads = d_model, n_heads, n_kv_heads
@@ -522,7 +523,7 @@ class CoDAGQAL:
         self.scale = 1.0 / math.sqrt(self.d_head)
         self.lambda_param = 0.1
         d_kv = self.d_head * n_kv_heads
-        rng = np.random.RandomState(42)
+        rng = np.random.RandomState(seed)
         self.W_Q  = rng.randn(d_model, d_model) * math.sqrt(2.0 / d_model)
         self.W_K1 = rng.randn(d_model, d_kv)     * math.sqrt(2.0 / d_model)
         self.W_K2 = rng.randn(d_model, d_kv)     * math.sqrt(2.0 / d_model)
@@ -543,6 +544,9 @@ class CoDAGQAL:
         self.ema_V = np.zeros(d_kv)
         self.ema_initialized = False
         self.total_tokens_processed = 0
+        # Populated by forward(); consumed by backward(). See the note on
+        # backward() for why this must be a cache rather than a recompute.
+        self._cache: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def _softmax(z: np.ndarray) -> np.ndarray:
@@ -675,8 +679,16 @@ class CoDAGQAL:
         # --- Landmark cache update ---
         Kflat = K1_kv.reshape(batch * seq, -1)
         Vflat = V_kv_orig.reshape(batch * seq, -1)
-        # Per-token importance = sum of attention mass over keys, mean over heads.
-        attn_mass = a1.sum(axis=-1).mean(axis=1).reshape(-1)  # (batch*seq,)
+        # Per-token importance = incoming attention mass summed over queries
+        # (how much attention this token receives as a key), mean over heads.
+        # NOTE: a1.sum(axis=-1) is a bug trap -- softmax always sums to 1.0
+        # along the key axis it was normalised over, so summing there yields a
+        # constant and destroys the signal. We must sum over the *query* axis
+        # (-2) instead, and restrict to the non-landmark key columns so the
+        # count lines up with Kflat/Vflat (which hold only the current-step
+        # keys, not the previously-cached landmarks).
+        lmc_prev = int(np.asarray(self.landmark_count).item())
+        attn_mass = a1[..., lmc_prev:].sum(axis=-2).mean(axis=1).reshape(-1)  # (batch*seq,)
         lmK, lmV = self._select_landmarks(Kflat, Vflat, attn_mass)
         free = self.n_landmarks - int(np.asarray(self.landmark_count).item())
         if free > 0:
@@ -688,6 +700,20 @@ class CoDAGQAL:
         self._update_ema(Kflat, Vflat)
 
         Of = O.reshape(batch * seq, self.n_heads * self.d_head)
+
+        # Cache activations for backward(). We deliberately cache rather than
+        # let backward() recompute the forward pass: the landmark cache and
+        # EMA above are mutated by *every* forward() call, so a naive
+        # recompute inside backward() would run against post-update landmark
+        # state and silently produce a gradient for a different (later)
+        # attention pattern than the one that actually produced this output.
+        self._cache = {
+            "batch": batch, "seq": seq, "d": d,
+            "xf": xf, "Q_t": Q_t,
+            "K1_full": K1_full, "K2_full": K2_full, "V_full": V_full,
+            "a1": a1, "a2": a2, "Of": Of,
+            "lmc": lmc_prev, "seq_offset": seq_offset,
+        }
         return (Of @ self.W_O).reshape(batch, seq, d)
 
     def backward(self, x: np.ndarray, grad_out: np.ndarray,
@@ -843,9 +869,9 @@ class FFNBlock:
     """Pre-norm residual SwiGLU FFN. y = x + W_down(SwiGLU(LN(x)))."""
     log = StructuredLogger("FFN")
 
-    def __init__(self, d_model: int, d_ffn: int):
+    def __init__(self, d_model: int, d_ffn: int, seed: int = 123):
         self.d_model, self.d_ffn = d_model, d_ffn
-        rng = np.random.RandomState(123)
+        rng = np.random.RandomState(seed)
         self.W_gate = rng.randn(d_model, d_ffn) * math.sqrt(2.0 / d_model)
         self.W_up   = rng.randn(d_model, d_ffn) * math.sqrt(2.0 / d_model)
         self.W_down = rng.randn(d_ffn, d_model)  * math.sqrt(2.0 / d_ffn)
@@ -916,7 +942,6 @@ class FFNBlock:
         return d_x, {"W_gate": dW_gate, "W_up": dW_up, "W_down": dW_down,
                      "gamma": dgamma, "beta": dbeta}
 
-
 # In[ ]:
 
 
@@ -933,15 +958,21 @@ class MoERouter:
     log = StructuredLogger("MoERouter")
 
     def __init__(self, d_model: int, n_experts: int, top_k: int,
-                 temperature: float = 1.0, aux_loss_coef: float = 0.01):
+                 temperature: float = 1.0, aux_loss_coef: float = 0.01,
+                 seed: int = 999):
         if top_k > n_experts:
             raise ValueError("top_k cannot exceed n_experts")
         self.d_model, self.n_experts, self.top_k = d_model, n_experts, top_k
         self.temperature, self.aux_loss_coef = temperature, aux_loss_coef
-        rng = np.random.RandomState(999)
+        rng = np.random.RandomState(seed)
         self.W_router = rng.randn(d_model, n_experts) * math.sqrt(2.0 / d_model)
         self.expert_stats = [ExpertStats(i) for i in range(n_experts)]
         self.routing_history: List[Dict] = []
+        # Cached from the last route() call so backward() can compute the
+        # aux-loss gradient without re-deriving softmax probs / f_mean.
+        self._last_x: Optional[np.ndarray] = None
+        self._last_probs: Optional[np.ndarray] = None
+        self._last_f_mean: Optional[np.ndarray] = None
 
     def route(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """Returns (top_k indices, normalised weights, auxiliary load-balance loss)."""
@@ -972,7 +1003,29 @@ class MoERouter:
             self.expert_stats[i].routing_prob  = float(P[i])
         self.routing_history.append({"f": f_mean.copy(), "P": P.copy(),
                                      "aux_loss": aux})
+        self._last_x, self._last_probs, self._last_f_mean = x, probs, f_mean
         return idx, wts, aux
+
+    def backward(self) -> np.ndarray:
+        """Gradient of the auxiliary load-balance loss w.r.t. W_router.
+
+        Without this, W_router is registered as a trainable parameter (see
+        TrainableEngine.PARAM_SCHEMA) and is checkpointed/exported, but the
+        training loop never computed a gradient for it, so it silently never
+        trained past its random initialisation.
+
+        The hard top-k dispatch (f_mean) is non-differentiable; matching the
+        standard Switch-Transformer/GShard treatment, f_mean is held constant
+        and only the softmax term P is differentiated.
+        """
+        if self._last_x is None:
+            raise RuntimeError("MoERouter.backward called before route")
+        x, probs, f_mean = self._last_x, self._last_probs, self._last_f_mean
+        n_tok = x.shape[0]
+        coef = self.aux_loss_coef * self.n_experts / (n_tok * self.temperature)
+        weighted = (probs * f_mean).sum(-1, keepdims=True)
+        d_logits = coef * probs * (f_mean[np.newaxis, :] - weighted)
+        return x.T @ d_logits
 
 
 class Expert(FFNBlock):
@@ -1026,10 +1079,12 @@ class MoELayer:
     log = StructuredLogger("MoELayer")
 
     def __init__(self, d_model: int, n_experts: int, top_k: int,
-                 d_ffn_per_expert: int, aux_loss_coef: float = 0.01):
+                 d_ffn_per_expert: int, aux_loss_coef: float = 0.01,
+                 seed: int = 999):
         self.d_model, self.n_experts, self.top_k = d_model, n_experts, top_k
-        self.router = MoERouter(d_model, n_experts, top_k, aux_loss_coef=aux_loss_coef)
-        self.experts = [Expert(i, d_model, d_ffn_per_expert)
+        self.router = MoERouter(d_model, n_experts, top_k,
+                                aux_loss_coef=aux_loss_coef, seed=seed)
+        self.experts = [Expert(i, d_model, d_ffn_per_expert, seed=seed + 100 + i)
                         for i in range(n_experts)]
         # Cache last forward routing so backward can reuse it without re-routing.
         self._last_idx: Optional[np.ndarray] = None
@@ -1072,7 +1127,7 @@ class MoELayer:
         return (xf + out).reshape(batch, seq, d), aux, loads
 
     def backward(self, x: np.ndarray,
-                 grad_out: np.ndarray) -> Tuple[np.ndarray, Dict]:
+                 grad_out: np.ndarray) -> Tuple[np.ndarray, Dict, np.ndarray]:
         """Approximate backward through the MoE layer.
 
         Uses routing cached from the last forward() call so expert stats and
@@ -1081,6 +1136,10 @@ class MoELayer:
         Token→expert routing maps are precomputed in O(n_tok * top_k) to avoid
         the O(n_experts * n_tok * top_k) Python loop that a naive scan would
         incur.
+
+        Returns (dx, experts_grads, router_grad); router_grad is the aux-loss
+        gradient w.r.t. W_router (see MoERouter.backward) -- previously this
+        method returned only expert gradients, so W_router never trained.
         """
         if self._last_idx is None:
             raise RuntimeError("MoELayer.backward called before forward")
@@ -1121,17 +1180,21 @@ class MoELayer:
 
             d_x, grads = self.experts[e].backward(bx, weighted_gf)
 
-            # d_x is the gradient of expert e's own forward() w.r.t. bx, and
-            # its input was already scaled by w_arr via weighted_gf above, so
-            # the routing weight is already baked into d_x -- do not reapply it.
+            # Accumulate expert input-gradient into the total. `d_x` is
+            # already d(loss)/d(bx) given the pre-scaled upstream gradient
+            # `weighted_gf` (= w_k * gf): FFNBlock.backward chains through
+            # both the expert's own internal residual and its FFN branch
+            # using that upstream gradient, so it already carries exactly
+            # one factor of w_k. Multiplying by w_arr[i] again here would
+            # double-count the routing weight and understate dx_acc.
             for i, t in enumerate(sel_tok):
                 dx_acc[t] += d_x[i]
 
             experts_grads[e].update(grads)
             experts_grads[e]["count"] = len(sel_tok)
 
-        return dx_acc.reshape(batch, seq, d), experts_grads
-
+        router_grad = self.router.backward()
+        return dx_acc.reshape(batch, seq, d), experts_grads, router_grad
 
 # In[ ]:
 
@@ -1271,7 +1334,6 @@ class MEMITEditor:
                 W += f.influence * f.delta_W
         return W
 
-
 # In[ ]:
 
 
@@ -1294,11 +1356,12 @@ class SimplicialComplexNN:
     """
     log = StructuredLogger("SimplicialNN")
 
-    def __init__(self, n_nodes: int, d_features: int, d_hidden: int):
+    def __init__(self, n_nodes: int, d_features: int, d_hidden: int,
+                 seed: int = 333):
         self.n_nodes, self.d_features, self.d_hidden = n_nodes, d_features, d_hidden
         self.edges: List[Tuple[int, int]] = []
         self.triangles: List[Tuple[int, int, int]] = []
-        rng = np.random.RandomState(333)
+        rng = np.random.RandomState(seed)
         self.W0     = rng.randn(d_features, d_hidden) * math.sqrt(2.0 / d_features)
         self.W_edge = rng.randn(d_features, d_hidden) * math.sqrt(2.0 / d_features)
 
@@ -1352,6 +1415,18 @@ class SimplicialComplexNN:
         edge_signal = (B1 @ x1) @ self.W_edge       # (n_nodes, d_hidden)
         return SwiGLU.swish(node_signal + edge_signal)
 
+        Args:
+            x0: Node features, shape (n_nodes, d_features).
+            x1: Edge features, shape (n_edges, d_features).
+                Defaults to B1.T @ x0 (coboundary of node features).
+        """
+        B1, _ = self.boundary_operators()
+        L0 = B1 @ B1.T                              # (n_nodes, n_nodes)
+        if x1 is None:
+            x1 = B1.T @ x0                          # (n_edges, d_features)
+        node_signal = (L0 @ x0) @ self.W0           # (n_nodes, d_hidden)
+        edge_signal = (B1 @ x1) @ self.W_edge       # (n_nodes, d_hidden)
+        return SwiGLU.swish(node_signal + edge_signal)
 
 # In[ ]:
 
@@ -1630,13 +1705,48 @@ class MetacognitiveTrainingLoop:
         grads: Dict[str, np.ndarray] = {}
 
         # ── Backward through MoE (input: ffn_out) ───────────────────────────
-        d_ffn_out, moe_grads = self.model.moe.backward(ffn_out, grad_out)
+        d_ffn_out, moe_grads, router_grad = self.model.moe.backward(ffn_out, grad_out)
+        grads["moe.router.W_router"] = router_grad
         for eid, eg in moe_grads.items():
             if eg["count"] == 0:
                 continue
             for k in ("W_gate", "W_up", "W_down", "gamma", "beta"):
                 if isinstance(eg[k], np.ndarray):
-                    grads[f"moe.expert{eid}.{k}"] = eg[k] / max(eg["count"], 1)
+                    # NOTE: do not divide by eg["count"] here. moe.backward()
+                    # already returns the exact gradient of the (batch-mean)
+                    # loss w.r.t. each expert's weights; dividing by the
+                    # number of tokens routed to the expert has no basis in
+                    # the chain rule and was verified (via finite-difference
+                    # gradient checking) to corrupt the gradient magnitude,
+                    # shrinking busier experts' updates more than idle ones.
+                    grads[f"moe.expert{eid}.{k}"] = eg[k]
+        # Router weights only ever receive the load-balancing aux-loss
+        # gradient (the routing decision itself is treated as a constant
+        # w.r.t. the task loss, per the standard top-k gating convention).
+        grads["moe.router.W_router"] = router_dW
+
+        # Backward through FFN using the gradient that actually flows in
+        # from MoE.
+        d_attn_out, ffn_grads = self.model.ffn.backward(attn_out, d_ffn_out)
+        for k, v in ffn_grads.items():
+            grads[f"ffn.{k}"] = v
+
+        # Backward through attention using the gradient that flows in from
+        # FFN, completing the chain rule all the way back to x.
+        _, attn_grads = self.model.attention.backward(x, d_attn_out)
+        for k, v in attn_grads.items():
+            grads[f"attn.{k}"] = v
+
+        # ── Backward through FFN (input: attn_out) ──────────────────────────
+        d_attn_out, ffn_grads = self.model.ffn.backward(attn_out, d_ffn_out)
+        for k, v in ffn_grads.items():
+            grads[f"ffn.{k}"] = v
+
+        # ── Backward through Attention (input: x) ───────────────────────────
+        _, attn_grads = self.model.attention.backward(x, d_attn_out,
+                                                      seq_offset=seq_off)
+        for k, v in attn_grads.items():
+            grads[f"attn.{k}"] = v
 
         # ── Backward through FFN (input: attn_out) ──────────────────────────
         d_attn_out, ffn_grads = self.model.ffn.backward(attn_out, d_ffn_out)
@@ -1689,7 +1799,6 @@ class MetacognitiveTrainingLoop:
             "history_length": len(self.state.loss_history),
             "complete": self.complete,
         }
-
 
 # In[ ]:
 
@@ -1754,22 +1863,31 @@ class TrainableEngine:
         self.manifold.perturb_metric(noise_scale=0.5)
         self.rope = RoPE(d_model=config.d_model, base=config.rope_base,
                          max_seq=config.max_seq)
+        # Component seeds are derived from config.seed (each offset by a fixed
+        # constant so they don't collide) so that changing EngineConfig.seed
+        # actually changes the model's initial weights -- previously every
+        # component used its own hardcoded literal RandomState seed, so two
+        # engines built with different config.seed values started identical.
         self.attention = CoDAGQAL(d_model=config.d_model,
                                   n_heads=config.n_heads,
                                   n_kv_heads=config.n_kv_heads,
                                   n_landmarks=config.n_landmarks,
                                   ema_decay=config.ema_decay,
-                                  rope=self.rope)
-        self.ffn = FFNBlock(d_model=config.d_model, d_ffn=config.d_ffn)
+                                  rope=self.rope,
+                                  seed=config.seed + 1)
+        self.ffn = FFNBlock(d_model=config.d_model, d_ffn=config.d_ffn,
+                            seed=config.seed + 2)
         self.moe = MoELayer(d_model=config.d_model, n_experts=config.n_experts,
                             top_k=config.top_k,
-                            d_ffn_per_expert=config.d_ffn_per_expert)
+                            d_ffn_per_expert=config.d_ffn_per_expert,
+                            seed=config.seed + 3)
         self.memit = MEMITEditor(d_model=config.d_model, layer_idx=0,
                                  lambda_reg=config.memit_lambda_reg)
         self.simplicial = SimplicialComplexNN(
             n_nodes=4,
             d_features=config.d_model // 4,
             d_hidden=config.d_model // 2,
+            seed=config.seed + 4,
         )
         for u, v in [(0, 1), (1, 2), (2, 3), (3, 0), (0, 2)]:
             self.simplicial.add_edge(u, v)
@@ -1885,7 +2003,6 @@ class TrainableEngine:
             return {"attn": attn_out, "ffn": ffn_out, "moe": moe_out, "aux": aux}
         return moe_out
 
-
 # In[ ]:
 
 
@@ -1951,7 +2068,6 @@ def load_checkpoint(path: str) -> Tuple[
                           if k in EngineConfig.__dataclass_fields__})
     state_dict = payload.get("state_dict", {})
     return cfg, state_dict, payload.get("trainer"), payload.get("extra")
-
 
 # In[ ]:
 
@@ -2031,7 +2147,6 @@ def inspect_safetensors(path: str) -> Dict:
         },
         "metadata": meta,
     }
-
 
 # ## Training driver
 # 

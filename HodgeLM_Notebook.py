@@ -489,6 +489,7 @@ class RoPE:
             out = out[0]
         return out
 
+
 # In[ ]:
 
 
@@ -513,8 +514,6 @@ class CoDAGQAL:
                  rope: Optional[RoPE] = None, seed: int = 42):
         if n_heads % n_kv_heads != 0:
             raise ValueError("n_heads must be divisible by n_kv_heads")
-        if d_model % n_heads != 0:
-            raise ValueError("d_model must be divisible by n_heads")
         self.d_model, self.n_heads, self.n_kv_heads = d_model, n_heads, n_kv_heads
         self.d_head = d_model // n_heads
         self.kv_groups = n_heads // n_kv_heads
@@ -533,6 +532,14 @@ class CoDAGQAL:
         self.landmark_K = np.zeros((n_landmarks, d_kv))
         self.landmark_V = np.zeros((n_landmarks, d_kv))
         self.landmark_count = np.array(0, dtype=np.int32)
+        # Snapshot of the landmark cache *as read* by the most recent
+        # forward() call, captured before that call writes any new
+        # landmarks. backward() must recompute against this snapshot rather
+        # than the live cache, since forward() mutates landmark_K/V/count as
+        # one of its side effects and backward() runs after that mutation.
+        self._last_lmc: Optional[int] = None
+        self._last_landmark_K: Optional[np.ndarray] = None
+        self._last_landmark_V: Optional[np.ndarray] = None
         self.ema_K = np.zeros(d_kv)
         self.ema_V = np.zeros(d_kv)
         self.ema_initialized = False
@@ -578,17 +585,28 @@ class CoDAGQAL:
             self.ema_K = self.ema_decay * self.ema_K + (1 - self.ema_decay) * Km
             self.ema_V = self.ema_decay * self.ema_V + (1 - self.ema_decay) * Vm
 
-    def _attend_with_landmarks(self, Q_t, K1_t, K2_t, V_t):
-        """Augments attention with stored landmarks."""
+    def _attend_with_landmarks(self, Q_t, K1_t, K2_t, V_t,
+                              lmc=None, landmark_K=None, landmark_V=None):
+        """Augments attention with stored landmarks.
+
+        lmc/landmark_K/landmark_V default to the engine's *current* cache
+        state (used by forward(), which calls this before mutating the
+        cache). backward() instead passes the exact snapshot forward()
+        captured at call time, so it reconstructs the same K1_full/K2_full/
+        V_full/mask forward() actually used even after the cache has since
+        been advanced by that same forward() call's landmark-cache update.
+        """
         batch, _, seq, _ = Q_t.shape
-        lmc = int(np.asarray(self.landmark_count).item())
+        if lmc is None:
+            lmc = int(np.asarray(self.landmark_count).item())
+            landmark_K, landmark_V = self.landmark_K, self.landmark_V
         if lmc == 0:
             return K1_t, K2_t, V_t, np.triu(np.full((seq, seq), -1e9), k=1)
-        lm_K = self.landmark_K[:lmc].reshape(lmc, self.n_kv_heads, self.d_head)
+        lm_K = landmark_K[:lmc].reshape(lmc, self.n_kv_heads, self.d_head)
         lm_K = np.repeat(lm_K, self.kv_groups, axis=1)
         lm_K_t = lm_K.transpose(1, 2, 0)[None, :, :, :]
         lm_K_t = np.repeat(lm_K_t, batch, axis=0)
-        lm_V = self.landmark_V[:lmc].reshape(lmc, self.n_kv_heads, self.d_head)
+        lm_V = landmark_V[:lmc].reshape(lmc, self.n_kv_heads, self.d_head)
         lm_V = np.repeat(lm_V, self.kv_groups, axis=1)
         lm_V_t = lm_V.transpose(1, 0, 2)[None, :, :, :]
         lm_V_t = np.repeat(lm_V_t, batch, axis=0)
@@ -634,7 +652,18 @@ class CoDAGQAL:
         K2_t = K2.transpose(0, 2, 3, 1)
         V_t  = V.transpose(0, 2, 1, 3)
 
-        K1_full, K2_full, V_full, mask = self._attend_with_landmarks(Q_t, K1_t, K2_t, V_t)
+        # Snapshot the cache exactly as read here (before this call's own
+        # landmark-cache update below mutates it) so backward() -- invoked
+        # after this call returns -- can replicate the same computation.
+        self._last_lmc = int(np.asarray(self.landmark_count).item())
+        self._last_landmark_K = self.landmark_K[:self._last_lmc].copy()
+        self._last_landmark_V = self.landmark_V[:self._last_lmc].copy()
+
+        K1_full, K2_full, V_full, mask = self._attend_with_landmarks(
+            Q_t, K1_t, K2_t, V_t,
+            lmc=self._last_lmc,
+            landmark_K=self._last_landmark_K,
+            landmark_V=self._last_landmark_V)
         s1 = (Q_t @ K1_full) * self.scale    # (batch, heads, seq, seq)
         s2 = (Q_t @ K2_full) * self.scale
 
@@ -693,7 +722,21 @@ class CoDAGQAL:
 
         Recomputes the forward activations (no activation cache) and returns
         (grad_x, param_grads).  param_grads keys: W_Q, W_K1, W_K2, W_V, W_O.
+
+        Uses the landmark-cache snapshot forward() captured at call time
+        (self._last_lmc/_last_landmark_K/_last_landmark_V) so the recomputed
+        activations match what that forward() call actually produced -- the
+        live self.landmark_count/K/V cannot be used here because forward()
+        mutates them (writes new landmarks) *after* reading them, so by the
+        time backward() runs the live cache may have already moved on.
+        Landmarks were written by a still-earlier call's activations, so
+        they are treated as detached constants: gradients from attending to
+        them still flow into dQ (and therefore dW_Q), but not into
+        W_K1/W_K2/W_V/x, since those landmark K/V values are no longer a
+        function of the current weights.
         """
+        if self._last_lmc is None:
+            raise RuntimeError("CoDAGQAL.backward called before forward")
         batch, seq, d = x.shape
         d_kv = self.d_head * self.n_kv_heads
         xf = x.reshape(batch * seq, d)                         # (BN, d)
@@ -722,12 +765,18 @@ class CoDAGQAL:
         K2_t = K2.transpose(0, 2, 3, 1)
         V_t  = V.transpose(0, 2, 1, 3)                        # (B, H, S, dh)
 
-        mask = np.triu(np.full((seq, seq), -1e9), k=1)
-        a1 = self._softmax((Q_t @ K1_t) * self.scale + mask)  # (B, H, S, S)
-        a2 = self._softmax((Q_t @ K2_t) * self.scale + mask)
+        # Use the snapshot forward() captured, not the (possibly already
+        # advanced) live cache -- see the docstring above.
+        lmc = self._last_lmc
+        K1_full, K2_full, V_full, mask = self._attend_with_landmarks(
+            Q_t, K1_t, K2_t, V_t,
+            lmc=lmc, landmark_K=self._last_landmark_K, landmark_V=self._last_landmark_V)
+
+        a1 = self._softmax((Q_t @ K1_full) * self.scale + mask)  # (B,H,S,lmc+S)
+        a2 = self._softmax((Q_t @ K2_full) * self.scale + mask)
         diff = a1 - self.lambda_param * a2
 
-        O_t = diff @ V_t                                       # (B, H, S, dh)
+        O_t = diff @ V_full                                    # (B, H, S, dh)
         Of  = O_t.transpose(0, 2, 1, 3).reshape(batch * seq,
                                                   self.n_heads * self.d_head)
 
@@ -742,23 +791,32 @@ class CoDAGQAL:
         dO_t = (dOf.reshape(batch, seq, self.n_heads, self.d_head)
                 .transpose(0, 2, 1, 3))
 
-        # Gradient through O_t = diff @ V_t
-        ddiff = dO_t @ V_t.transpose(0, 1, 3, 2)              # (B, H, S, S)
-        dV_t  = diff.transpose(0, 1, 3, 2) @ dO_t             # (B, H, S, dh)
+        # Gradient through O_t = diff @ V_full
+        ddiff   = dO_t @ V_full.transpose(0, 1, 3, 2)          # (B, H, S, lmc+S)
+        dV_full = diff.transpose(0, 1, 3, 2) @ dO_t            # (B, H, lmc+S, dh)
 
         # Gradient through diff = a1 - lambda * a2
         da1 =  ddiff
         da2 = -self.lambda_param * ddiff
 
         # Gradient through softmax (includes the scale factor)
-        ds1 = self._softmax_backward(da1, a1) * self.scale     # (B, H, S, S)
+        ds1 = self._softmax_backward(da1, a1) * self.scale     # (B, H, S, lmc+S)
         ds2 = self._softmax_backward(da2, a2) * self.scale
 
-        # Gradient through s1 = Q_t @ K1_t
-        dQ_t  = (ds1 @ K1_t.transpose(0, 1, 3, 2)             # from K1
-                 + ds2 @ K2_t.transpose(0, 1, 3, 2))           # from K2
-        dK1_t = Q_t.transpose(0, 1, 3, 2) @ ds1               # (B, H, dh, S)
-        dK2_t = Q_t.transpose(0, 1, 3, 2) @ ds2
+        # Gradient through s1 = Q_t @ K1_full / s2 = Q_t @ K2_full.
+        # dQ_t collects contributions from attending to both landmark and
+        # current-step keys; landmarks contribute no further gradient below.
+        dQ_t     = (ds1 @ K1_full.transpose(0, 1, 3, 2)
+                    + ds2 @ K2_full.transpose(0, 1, 3, 2))
+        dK1_full = Q_t.transpose(0, 1, 3, 2) @ ds1              # (B,H,dh,lmc+S)
+        dK2_full = Q_t.transpose(0, 1, 3, 2) @ ds2
+
+        # Landmarks are detached constants (written by a past call), so only
+        # the trailing `seq` columns -- this call's own K/V -- propagate
+        # further into the parameter and input gradients below.
+        dK1_t = dK1_full[..., lmc:]                             # (B, H, dh, S)
+        dK2_t = dK2_full[..., lmc:]
+        dV_t  = dV_full[:, :, lmc:, :]                          # (B, H, S, dh)
 
         # ── Undo GQA expansion (sum over kv_groups) ─────────────────────────
         def _undo_gqa(dX_full):
@@ -801,6 +859,7 @@ class CoDAGQAL:
 
         return dx, {"W_Q": dW_Q, "W_K1": dW_K1, "W_K2": dW_K2,
                     "W_V": dW_V, "W_O": dW_O}
+
 
 # In[ ]:
 
@@ -970,14 +1029,50 @@ class MoERouter:
 
 
 class Expert(FFNBlock):
-    def __init__(self, expert_id: int, d_model: int, d_ffn: int,
-                 seed: Optional[int] = None):
-        # Each expert must start from distinct weights -- previously every
-        # Expert used FFNBlock's hardcoded seed=123 regardless of expert_id,
-        # so all experts in a layer were initialised identically (MoE collapse).
-        super().__init__(d_model, d_ffn, seed=123 + expert_id if seed is None else seed)
+    """An FFNBlock used inside MoELayer.
+
+    Overrides forward()/backward() to return the *pure* SwiGLU-FFN
+    transformation with no residual term. MoELayer combines multiple
+    weighted experts per token and adds the single residual connection
+    itself; if each Expert also added its own `x +`, a token routed
+    through experts whose weights sum to 1 would get the input added
+    twice (once per expert-weighted sum, once at the MoE boundary).
+    """
+
+    def __init__(self, expert_id: int, d_model: int, d_ffn: int):
+        super().__init__(d_model, d_ffn)
         self.expert_id = expert_id
         self.tokens_seen = 0
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        xn = self._layer_norm(x)
+        hidden = SwiGLU.forward(xn, self.W_gate, self.W_up)
+        return hidden @ self.W_down
+
+    def backward(self, x: np.ndarray, grad_out: np.ndarray):
+        """Returns (d_x, grads_dict); d_x has no residual term (see class docstring)."""
+        xn = self._layer_norm(x)
+        hidden = SwiGLU.forward(xn, self.W_gate, self.W_up)
+
+        d_hidden = grad_out @ self.W_down.T
+        dW_down  = hidden.reshape(-1, self.d_ffn).T @ grad_out.reshape(-1, self.d_model)
+
+        d_xn, dW_gate, dW_up = SwiGLU.backward(xn, self.W_gate, self.W_up, d_hidden)
+        d_xn_norm = self._layer_norm_backward(x, d_xn)
+
+        # No residual term: MoELayer supplies the single skip-connection
+        # gradient itself (see MoELayer.backward's `dx_acc = gf.copy()`).
+        d_x = d_xn_norm
+
+        eps = 1e-8
+        mu  = x.mean(-1, keepdims=True)
+        var = x.var(-1,  keepdims=True)
+        x_hat = (x - mu) / np.sqrt(var + eps)
+        dgamma = np.sum(x_hat * d_xn, axis=tuple(range(x.ndim - 1)))
+        dbeta  = np.sum(d_xn,         axis=tuple(range(x.ndim - 1)))
+
+        return d_x, {"W_gate": dW_gate, "W_up": dW_up, "W_down": dW_down,
+                     "gamma": dgamma, "beta": dbeta}
 
 
 class MoELayer:
@@ -1025,7 +1120,10 @@ class MoELayer:
             else:
                 loads.append(0)
 
-        # Residual: output = input + weighted expert outputs.
+        # Residual: output = input + weighted expert outputs. Expert.forward()
+        # returns the *pure* FFN transform (no residual of its own -- see the
+        # Expert class override above), so this is the only place the residual
+        # is added, and it is added exactly once.
         return (xf + out).reshape(batch, seq, d), aux, loads
 
     def backward(self, x: np.ndarray,
@@ -1135,6 +1233,7 @@ class TensorParallelMatMul:
         for i, s in enumerate(self.shards[1:], start=1):
             result = result + x[..., i * sz:(i + 1) * sz] @ s
         return result
+
 
 # In[ ]:
 
@@ -1302,6 +1401,19 @@ class SimplicialComplexNN:
     def forward(self, x0: np.ndarray,
                 x1: Optional[np.ndarray] = None) -> np.ndarray:
         """Message passing forward.
+
+        Args:
+            x0: Node features, shape (n_nodes, d_features).
+            x1: Edge features, shape (n_edges, d_features).
+                Defaults to B1.T @ x0 (coboundary of node features).
+        """
+        B1, _ = self.boundary_operators()
+        L0 = B1 @ B1.T                              # (n_nodes, n_nodes)
+        if x1 is None:
+            x1 = B1.T @ x0                          # (n_edges, d_features)
+        node_signal = (L0 @ x0) @ self.W0           # (n_nodes, d_hidden)
+        edge_signal = (B1 @ x1) @ self.W_edge       # (n_nodes, d_hidden)
+        return SwiGLU.swish(node_signal + edge_signal)
 
         Args:
             x0: Node features, shape (n_nodes, d_features).
@@ -1636,6 +1748,17 @@ class MetacognitiveTrainingLoop:
         for k, v in attn_grads.items():
             grads[f"attn.{k}"] = v
 
+        # ── Backward through FFN (input: attn_out) ──────────────────────────
+        d_attn_out, ffn_grads = self.model.ffn.backward(attn_out, d_ffn_out)
+        for k, v in ffn_grads.items():
+            grads[f"ffn.{k}"] = v
+
+        # ── Backward through Attention (input: x) ───────────────────────────
+        _, attn_grads = self.model.attention.backward(x, d_attn_out,
+                                                      seq_offset=seq_off)
+        for k, v in attn_grads.items():
+            grads[f"attn.{k}"] = v
+
         self._sgd_step(grads)
 
         err = float(loss) / (float(np.var(y)) + 1e-8)
@@ -1908,10 +2031,7 @@ def save_checkpoint(path: str, engine: "TrainableEngine",
             "step": trainer.step,
             "lr": trainer.lr,
             "complete": trainer.complete,
-            "loss_history": list(trainer.state.loss_history),
-            "error_rates": list(trainer.state.error_rates),
-            "aux_history": list(trainer.state.aux_history),
-            "lr_history": list(trainer.state.lr_history),
+            "training_state": trainer.state.to_dict(),
         }
     if extra:
         payload["extra"] = extra
@@ -2171,73 +2291,82 @@ def parity_check(engine_a: "TrainableEngine", engine_b: "TrainableEngine",
 
 
 # 24. End-to-end demonstration
-from pathlib import Path
+#
+# Wrapped in main() + a __main__ guard so importing this module (e.g. from
+# a test suite or another script) does not trigger a full training run as
+# a side effect -- only running this file directly does.
+def main():
+    from pathlib import Path
 
-STEPS       = 40
-CKPT_EVERY  = 10
-LOG_EVERY   = 1
-CKPT_DIR    = "artifacts/checkpoints"
-SAFETENSORS = "artifacts/engine.safetensors"
+    STEPS       = 40
+    CKPT_EVERY  = 10
+    LOG_EVERY   = 1
+    CKPT_DIR    = "artifacts/checkpoints"
+    SAFETENSORS = "artifacts/engine.safetensors"
 
-# 1. Fresh build + train + checkpoint + safetensors export.
-result = train_engine(
-    cfg=EngineConfig(),
-    max_steps=STEPS,
-    checkpoint_every=CKPT_EVERY,
-    checkpoint_dir=CKPT_DIR,
-    safetensors_path=SAFETENSORS,
-    log_every=LOG_EVERY,
-    seed=2026,
-)
+    # 1. Fresh build + train + checkpoint + safetensors export.
+    result = train_engine(
+        cfg=EngineConfig(),
+        max_steps=STEPS,
+        checkpoint_every=CKPT_EVERY,
+        checkpoint_dir=CKPT_DIR,
+        safetensors_path=SAFETENSORS,
+        log_every=LOG_EVERY,
+        seed=2026,
+    )
 
-# 2. Inspect the safetensors file.
-print("\n--- safetensors inspection ---")
-info = inspect_safetensors(SAFETENSORS)
-print(f"path        : {info['path']}")
-print(f"tensors     : {len(info['tensors'])}")
-print(f"metadata    : {sorted(info['metadata'].keys())}")
-for name, meta in list(info['tensors'].items())[:6]:
-    print(f"  {name:<28s} shape={meta['shape']} dtype={meta['dtype']}")
-print(f"  ... ({len(info['tensors']) - 6} more tensors)")
+    # 2. Inspect the safetensors file.
+    print("\n--- safetensors inspection ---")
+    info = inspect_safetensors(SAFETENSORS)
+    print(f"path        : {info['path']}")
+    print(f"tensors     : {len(info['tensors'])}")
+    print(f"metadata    : {sorted(info['metadata'].keys())}")
+    for name, meta in list(info['tensors'].items())[:6]:
+        print(f"  {name:<28s} shape={meta['shape']} dtype={meta['dtype']}")
+    print(f"  ... ({len(info['tensors']) - 6} more tensors)")
 
-# 3. Reload into a brand-new engine.
-loaded_engine = load_for_inference(SAFETENSORS)
+    # 3. Reload into a brand-new engine.
+    loaded_engine = load_for_inference(SAFETENSORS)
 
-# 4. Round-trip parity check.
-# Both engines use seq_offset=0 so divergent PRNG states don't affect the result.
-print("\n--- parity check (trained vs reloaded) ---")
-test_x = np.random.RandomState(0).randn(2, 8, loaded_engine.config.d_model)
-parity = parity_check(result["engine"], loaded_engine, test_x, seq_offset=0)
-print(f"max |\u0394|      : {parity['max_abs_diff']:.2e}")
-print(f"output shape : {parity['shape']}")
-print(f"match        : {parity['match']}")
+    # 4. Round-trip parity check.
+    # Both engines use seq_offset=0 so divergent PRNG states don't affect the result.
+    print("\n--- parity check (trained vs reloaded) ---")
+    test_x = np.random.RandomState(0).randn(2, 8, loaded_engine.config.d_model)
+    parity = parity_check(result["engine"], loaded_engine, test_x, seq_offset=0)
+    print(f"max |\u0394|      : {parity['max_abs_diff']:.2e}")
+    print(f"output shape : {parity['shape']}")
+    print(f"match        : {parity['match']}")
 
-# 5. Show training summary.
-print("\n--- training summary ---")
-hist = result["history"]
-print(f"steps        : {len(hist)}")
-print(f"init loss    : {hist[0]['loss']:.6f}")
-print(f"final loss   : {hist[-1]['loss']:.6f}")
-print(f"loss delta   : {hist[-1]['loss'] - hist[0]['loss']:+.6f}")
-print(f"init err     : {hist[0]['error_rate']:.4f}")
-print(f"final err    : {hist[-1]['error_rate']:.4f}")
+    # 5. Show training summary.
+    print("\n--- training summary ---")
+    hist = result["history"]
+    print(f"steps        : {len(hist)}")
+    print(f"init loss    : {hist[0]['loss']:.6f}")
+    print(f"final loss   : {hist[-1]['loss']:.6f}")
+    print(f"loss delta   : {hist[-1]['loss'] - hist[0]['loss']:+.6f}")
+    print(f"init err     : {hist[0]['error_rate']:.4f}")
+    print(f"final err    : {hist[-1]['error_rate']:.4f}")
 
-# 6. List checkpoint files on disk.
-print("\n--- checkpoint files ---")
-for p in sorted(Path(CKPT_DIR).glob("*.pkl")):
-    print(f"  {p.name:<24s} {p.stat().st_size:>8d} bytes")
+    # 6. List checkpoint files on disk.
+    print("\n--- checkpoint files ---")
+    for p in sorted(Path(CKPT_DIR).glob("*.pkl")):
+        print(f"  {p.name:<24s} {p.stat().st_size:>8d} bytes")
 
-# 7. Demonstrate resume from final checkpoint.
-print("\n--- resume from final checkpoint + 5 extra steps ---")
-resumed = train_engine(
-    resume_from=str(Path(CKPT_DIR) / "final.pkl"),
-    max_steps=5,
-    checkpoint_every=5,
-    checkpoint_dir=str(Path(CKPT_DIR) / "resumed"),
-    safetensors_path="artifacts/engine_resumed.safetensors",
-    log_every=1,
-)
-print(f"resumed loss : {resumed['history'][0]['loss']:.6f}")
+    # 7. Demonstrate resume from final checkpoint.
+    print("\n--- resume from final checkpoint + 5 extra steps ---")
+    resumed = train_engine(
+        resume_from=str(Path(CKPT_DIR) / "final.pkl"),
+        max_steps=5,
+        checkpoint_every=5,
+        checkpoint_dir=str(Path(CKPT_DIR) / "resumed"),
+        safetensors_path="artifacts/engine_resumed.safetensors",
+        log_every=1,
+    )
+    print(f"resumed loss : {resumed['history'][0]['loss']:.6f}")
+
+
+if __name__ == "__main__":
+    main()
 
 
 # ## What just happened
